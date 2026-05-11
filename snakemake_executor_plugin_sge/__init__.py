@@ -355,7 +355,6 @@ class Executor(RemoteExecutor):
 
         # Track submitted job IDs for cancellation
         self._submitted_job_ids: List[str] = []
-        self._submit_times: Dict[str, float] = {}
 
         atexit.register(self.clean_old_logs)
 
@@ -371,8 +370,6 @@ class Executor(RemoteExecutor):
     # ------------------------------------------------------------------
 
     def _report_submission_threadsafe(self, job_info: SubmittedJobInfo) -> None:
-        import time
-        self._submit_times[job_info.external_jobid] = time.time()
         if self._main_event_loop is not None:
             self._main_event_loop.call_soon_threadsafe(
                 self.report_job_submission, job_info
@@ -503,6 +500,7 @@ class Executor(RemoteExecutor):
                 aux={
                     "log_stdout": log_stdout_resolved,
                     "log_stderr": log_stderr_resolved,
+                    "submit_time": time.time(),
                 },
             )
         )
@@ -658,7 +656,11 @@ class Executor(RemoteExecutor):
                     SubmittedJobInfo(
                         job,
                         external_jobid=external_id,
-                        aux={"log_stdout": log_o, "log_stderr": log_e},
+                        aux={
+                            "log_stdout": log_o,
+                            "log_stderr": log_e,
+                            "submit_time": time.time(),
+                        },
                     )
                 )
 
@@ -688,7 +690,6 @@ class Executor(RemoteExecutor):
                     active_jobs,
                     use_qacct=settings.use_qacct,
                     logger=self.logger,
-                    submit_times=self._submit_times,
                 )
                 if status_map is not None:
                     break

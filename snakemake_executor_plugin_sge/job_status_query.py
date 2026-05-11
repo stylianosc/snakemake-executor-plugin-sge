@@ -168,7 +168,6 @@ async def query_job_status(
     active_jobs,
     use_qacct: bool,
     logger,
-    submit_times: Optional[Dict[str, float]] = None,
 ) -> Optional[Dict[str, str]]:
     """Asynchronously query qstat (and optionally qacct) for all active jobs."""
     import time
@@ -188,6 +187,8 @@ async def query_job_status(
 
     status_map: Dict[str, str] = {}
 
+    active_jobs_map = {j.external_jobid: j for j in active_jobs}
+
     for jid in job_ids:
         # qstat is the ground truth for currently running jobs
         if jid in qstat_status:
@@ -196,7 +197,8 @@ async def query_job_status(
 
         # If it's not in qstat, it might have finished or hasn't appeared yet.
         # Check grace period first!
-        submit_time = submit_times.get(jid, 0) if submit_times else 0
+        j = active_jobs_map.get(jid)
+        submit_time = j.aux.get("submit_time", 0) if j and j.aux else 0
         if time.time() - submit_time < 20:
             # Job is too young to be considered finished, even if it's not in qstat
             # or if qacct returns an old reused job ID.
