@@ -64,8 +64,9 @@ def get_submit_command(
     job,
     params: dict,
     settings,
-    script_path: str,
-    array_range: str,
+    exec_cmd: Optional[str] = None,
+    script_path: Optional[str] = None,
+    is_array: bool = False,
 ) -> str:
     """Return the complete qsub command string.
 
@@ -77,15 +78,18 @@ def get_submit_command(
         run_uuid    – unique ID for the whole Snakemake run
         log_dir     – directory for stdout/stderr logs
         workdir     – workflow working directory
+        array_range - SGE array range string (if is_array is True)
     settings:
         ExecutorSettings instance.
+    exec_cmd:
+        The execution command (if script_path is None).
     script_path:
         Path to the already-written bash submission script.
-    array_range:
-        SGE array range string, e.g. '1-50' or '1-1'.
+    is_array:
+        Whether this is an array job.
     """
-    log_dir   = Path(params["log_dir"])
-    run_uuid  = params["run_uuid"]
+    log_dir   = Path(params.get("log_dir") or str(params.get("log_stdout", "")).rsplit("/", 1)[0])
+    run_uuid  = params.get("run_uuid", "0000")
     workdir   = params.get("workdir", "")
 
     # ── job name (max 64 chars, must start with letter) ────────────────────
@@ -243,15 +247,21 @@ def get_submit_command(
     if task_concurrency is not None:
         call += f" -tc {int(task_concurrency)}"
 
-    # ── array range (always present, even for singletons: -t 1-1) ────────
-    call += f" -t {array_range}"
+    # ── array range ───────────────────────────────────────────────────
+    if is_array:
+        array_range = params.get("array_range", "1-1")
+        call += f" -t {array_range}"
 
     # ── extra qsub flags (per-rule or global) ──────────────────────────
     sge_extra = job.resources.get("sge_extra") or getattr(settings, "extra", None)
     if sge_extra:
         call += f" {sge_extra}"
 
-    # ── submission script ───────────────────────────────────────────────
-    call += f" {_safe(script_path)}"
+    # ── submission script or command ────────────────────────────────────
+    if script_path:
+        call += f" {_safe(script_path)}"
+    elif exec_cmd:
+        # Pass the command via stdin if there is no script
+        call = f"echo {_safe(exec_cmd)} | {call}"
 
     return call
