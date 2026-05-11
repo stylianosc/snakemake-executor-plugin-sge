@@ -287,6 +287,10 @@ common_settings = CommonSettings(
     pass_default_resources_args=True,
     pass_envvar_declarations_to_cmd=False,
     auto_deploy_default_storage_provider=False,
+    # Wait 30s before the first status poll so SGE has time to register
+    # newly submitted jobs in qstat.  Without this the wait thread polls
+    # immediately and sees an empty qstat, marking jobs as finished.
+    init_seconds_before_status_checks=30,
 )
 
 
@@ -704,8 +708,18 @@ class Executor(RemoteExecutor):
             return
 
         any_finished = False
+        self.logger.debug(
+            f"check_active_jobs: {len(active_jobs)} active, "
+            f"status_map keys={list(status_map.keys())}, "
+            f"values={list(status_map.values())}"
+        )
         for j in active_jobs:
             status = status_map.get(j.external_jobid)
+            submit_t = j.aux.get("submit_time", "N/A") if j.aux else "no-aux"
+            self.logger.debug(
+                f"  job {j.external_jobid}: status={status}, "
+                f"submit_time={submit_t}, aux_keys={list(j.aux.keys()) if j.aux else None}"
+            )
 
             if status is None:
                 # Job not yet visible to qstat/qacct — assume still queued
