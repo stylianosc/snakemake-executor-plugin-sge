@@ -67,6 +67,7 @@ def get_submit_command(
     exec_cmd: Optional[str] = None,
     script_path: Optional[str] = None,
     is_array: bool = False,
+    hold_jid_list: Optional[list] = None,
 ) -> str:
     """Return the complete qsub command string.
 
@@ -232,12 +233,16 @@ def get_submit_command(
         call += f" -M {_safe(mail_addr)}"
 
     # ── job hold ──────────────────────────────────────────────────
+    # Priority: explicit resource/setting > auto-resolved from DAG
     hold_jid = (
         job.resources.get("sge_hold_jid")
         or getattr(settings, "hold_jid", None)
     )
     if hold_jid:
         call += f" -hold_jid {_safe(str(hold_jid))}"
+    elif hold_jid_list:
+        # Auto-resolved dependencies from Snakemake DAG (--immediate-submit)
+        call += f" -hold_jid {','.join(hold_jid_list)}"
 
     hold_jid_ad = (
         job.resources.get("sge_hold_jid_ad")

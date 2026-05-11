@@ -438,6 +438,30 @@ class Executor(RemoteExecutor):
     # Single-job submission
     # ------------------------------------------------------------------
 
+    def _resolve_sge_dependencies(self, job) -> List[str]:
+        """Resolve upstream SGE job IDs for a given job.
+
+        When --immediate-submit is used, Snakemake submits jobs in DAG order
+        and expects the executor to wire up cluster-level dependencies.
+        This method looks up the SGE job IDs of all upstream jobs so that
+        qsub can be called with -hold_jid.
+        """
+        dep_ids = []
+        try:
+            dag_deps = self.workflow.dag.dependencies.get(job, {})
+            for upstream_job in dag_deps:
+                # Check our internal mapping first (populated by _report_submission_threadsafe)
+                ext_ids = self.workflow.persistence.external_jobids(upstream_job)
+                for eid in ext_ids:
+                    if eid is not None:
+                        # Strip task suffix for array jobs to get base job ID
+                        base_id = str(eid).split(".")[0]
+                        if base_id not in dep_ids:
+                            dep_ids.append(base_id)
+        except Exception as exc:
+            self.logger.debug(f"Could not resolve dependencies for job {job.jobid}: {exc}")
+        return dep_ids
+
     def run_job(self, job: JobExecutorInterface) -> None:
         """Submit a single job via qsub."""
         group_or_rule = f"group_{job.name}" if job.is_group() else f"rule_{job.name}"
@@ -457,12 +481,16 @@ class Executor(RemoteExecutor):
             "workdir": self.workflow.workdir_init,
         }
 
+        # Resolve upstream SGE job IDs for -hold_jid (needed for --immediate-submit)
+        dep_ids = self._resolve_sge_dependencies(job)
+
         exec_job = self.format_job_exec(job)
         call = get_submit_command(
             job,
             job_params,
             settings=self.workflow.executor_settings,
             exec_cmd=exec_job,
+            hold_jid_list=dep_ids,
         )
 
         self.logger.debug(f"qsub call: {call}")
