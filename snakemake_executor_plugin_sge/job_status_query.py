@@ -197,7 +197,7 @@ async def query_job_status(
         # If it's not in qstat, it might have finished or hasn't appeared yet.
         # Check grace period first!
         submit_time = submit_times.get(jid, 0) if submit_times else 0
-        if time.time() - submit_time < 60:
+        if time.time() - submit_time < 20:
             # Job is too young to be considered finished, even if it's not in qstat
             # or if qacct returns an old reused job ID.
             continue  # leave it absent from status_map -> treats as queued/running
