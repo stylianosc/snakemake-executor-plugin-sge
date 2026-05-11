@@ -1,0 +1,33 @@
+[tool.poetry]
+name = "snakemake-executor-plugin-sge"
+version = "0.1.0"
+description = "A Snakemake executor plugin for submitting jobs to a SGE/UGE/OGS cluster."
+authors = [
+    "Stylianos Serghiou <stylianosc@github.com>",
+]
+readme = "README.md"
+license = "MIT"
+repository = "https://github.com/stylianosc/snakemake-executor-plugin-sge"
+keywords = ["snakemake", "plugin", "executor", "cluster", "sge", "uge", "gridengine"]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+snakemake-interface-common = "^1.21.0"
+snakemake-interface-executor-plugins = "^9.3.9"
+
+[tool.poetry.group.dev.dependencies]
+black = "^23.7.0"
+flake8 = "^6.1.0"
+coverage = "^7.3.1"
+pytest = "^8.3.5"
+snakemake = "^9.0.0"
+
+[tool.black]
+line-length = 88
+
+[tool.pytest.ini_options]
+python_files = ["test_*.py", "tests.py"]
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
