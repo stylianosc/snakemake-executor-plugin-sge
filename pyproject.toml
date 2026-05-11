@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "snakemake-executor-plugin-sge"
-version = "0.2.4"
+version = "0.2.5"
 description = "A Snakemake executor plugin for submitting jobs to SGE/UGE/OGS clusters."
 authors = ["Stylianos Charalampous <stylianosc@github.com>"]
 readme  = "README.md"

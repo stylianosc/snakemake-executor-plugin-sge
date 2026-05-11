@@ -355,6 +355,7 @@ class Executor(RemoteExecutor):
 
         # Track submitted job IDs for cancellation
         self._submitted_job_ids: List[str] = []
+        self._submit_times: Dict[str, float] = {}
 
         atexit.register(self.clean_old_logs)
 
