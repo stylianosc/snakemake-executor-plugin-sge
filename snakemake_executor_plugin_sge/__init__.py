@@ -374,6 +374,16 @@ class Executor(RemoteExecutor):
         # Track submitted job IDs for cancellation
         self._submitted_job_ids: List[str] = []
 
+        # Authoritative mapping from a Snakemake job to its SGE submission.
+        # Each entry is (sge_jobid, task_idx) where task_idx is None for
+        # non-array (single qsub) submissions or the 1-based array task
+        # index for array submissions.  Used to resolve cross-job
+        # dependencies under --immediate-submit without depending on
+        # Snakemake's persistence layer (which doesn't always have the
+        # external_jobid populated by the time downstream submissions
+        # need it).
+        self._job_to_sge: "dict[JobExecutorInterface, tuple]" = {}
+
         atexit.register(self.clean_old_logs)
 
         # Warn if neither qstat nor qacct is available
@@ -549,52 +559,40 @@ class Executor(RemoteExecutor):
         all the upstream array job IDs to pass to plain -hold_jid (whole
         upstream array(s) must finish first).
         """
-        # Per-task upstream IDs (full external IDs like "12345.7")
-        per_task_ext: List[List[str]] = []
-        all_base_ids: List[str] = []  # for whole-array fallback
+        # Collect each chunk task's upstreams.  Each entry is a list of
+        # (sge_jobid, task_idx) tuples; task_idx is None when the
+        # upstream was a single (non-array) submission.
+        per_task: List[List[tuple]] = []
+        all_base_ids: List[str] = []
         for j in chunk_jobs:
-            ext_ids: List[str] = []
-            try:
-                dag_deps = self.workflow.dag.dependencies.get(j, {})
-                for upstream_job in dag_deps:
-                    for eid in self.workflow.persistence.external_jobids(upstream_job):
-                        if eid is None:
-                            continue
-                        ext_ids.append(str(eid))
-                        base = str(eid).split(".")[0]
-                        if base not in all_base_ids:
-                            all_base_ids.append(base)
-            except Exception as exc:
-                self.logger.debug(
-                    f"Could not resolve deps for job {j.jobid}: {exc}"
-                )
-            per_task_ext.append(ext_ids)
+            entries: List[tuple] = []
+            for _up, sge_jobid, task_idx in self._upstream_ext_ids(j):
+                entries.append((sge_jobid, task_idx))
+                if sge_jobid not in all_base_ids:
+                    all_base_ids.append(sge_jobid)
+            per_task.append(entries)
 
         if not all_base_ids:
             return (None, [])
 
         # -hold_jid_ad eligibility: every chunk task has exactly one
-        # upstream, all upstreams belong to the same array job, and the
+        # upstream, all upstreams share a single array job, and each
         # upstream task index equals the downstream task index.
         if len(all_base_ids) != 1:
             return (None, all_base_ids)
         upstream_base = all_base_ids[0]
 
-        for offset, ext_ids in enumerate(per_task_ext):
-            if len(ext_ids) != 1:
+        for offset, entries in enumerate(per_task):
+            if len(entries) != 1:
                 return (None, all_base_ids)
-            up_id = ext_ids[0]
-            if "." not in up_id:
-                # Upstream was not submitted as an array; -hold_jid_ad
-                # would refuse it.  Fall back to whole-job hold.
+            sge_jobid, task_idx = entries[0]
+            if task_idx is None:
+                # Upstream was a single (non-array) submission.
+                # -hold_jid_ad needs an array on both sides.
                 return (None, all_base_ids)
-            base, _, up_task = up_id.partition(".")
-            if base != upstream_base:
+            if sge_jobid != upstream_base:
                 return (None, all_base_ids)
-            try:
-                if int(up_task) != chunk_start + offset:
-                    return (None, all_base_ids)
-            except ValueError:
+            if task_idx != chunk_start + offset:
                 return (None, all_base_ids)
 
         self.logger.debug(
@@ -602,28 +600,41 @@ class Executor(RemoteExecutor):
         )
         return (upstream_base, [])
 
-    def _resolve_sge_dependencies(self, job) -> List[str]:
-        """Resolve upstream SGE job IDs for a given job.
+    def _upstream_ext_ids(self, job):
+        """Yield ``(upstream_job, sge_jobid, task_idx)`` for each upstream.
 
-        When --immediate-submit is used, Snakemake submits jobs in DAG order
-        and expects the executor to wire up cluster-level dependencies.
-        This method looks up the SGE job IDs of all upstream jobs so that
-        qsub can be called with -hold_jid.
+        Reads from our authoritative in-memory map.  ``task_idx`` is
+        ``None`` if the upstream was a single (non-array) submission.
         """
-        dep_ids = []
         try:
             dag_deps = self.workflow.dag.dependencies.get(job, {})
-            for upstream_job in dag_deps:
-                # Check our internal mapping first (populated by _report_submission_threadsafe)
-                ext_ids = self.workflow.persistence.external_jobids(upstream_job)
-                for eid in ext_ids:
-                    if eid is not None:
-                        # Strip task suffix for array jobs to get base job ID
-                        base_id = str(eid).split(".")[0]
-                        if base_id not in dep_ids:
-                            dep_ids.append(base_id)
         except Exception as exc:
-            self.logger.debug(f"Could not resolve dependencies for job {job.jobid}: {exc}")
+            self.logger.debug(
+                f"Could not read DAG dependencies for job {job.jobid}: {exc}"
+            )
+            return
+        for upstream_job in dag_deps:
+            entry = self._job_to_sge.get(upstream_job)
+            if entry is None:
+                # Upstream hasn't been submitted yet (shouldn't happen
+                # under --immediate-submit since Snakemake walks the DAG
+                # in topological order); skip silently.
+                continue
+            sge_jobid, task_idx = entry
+            yield upstream_job, sge_jobid, task_idx
+
+    def _resolve_sge_dependencies(self, job) -> List[str]:
+        """Return a deduped list of upstream SGE base job IDs.
+
+        Used for single-task -hold_jid submission.  Drops any per-task
+        suffix so the dependent waits on the whole upstream (array or
+        not).
+        """
+        dep_ids: List[str] = []
+        for _, sge_jobid, _ in self._upstream_ext_ids(job):
+            base_id = str(sge_jobid).split(".")[0]
+            if base_id not in dep_ids:
+                dep_ids.append(base_id)
         return dep_ids
 
     def run_job(self, job: JobExecutorInterface) -> None:
@@ -686,6 +697,9 @@ class Executor(RemoteExecutor):
             f"(log: {logdir})"
         )
         self._submitted_job_ids.append(sge_jobid)
+        # Record the job→SGE-id mapping BEFORE notifying Snakemake so any
+        # downstream submission triggered by the report sees it.
+        self._job_to_sge[job] = (sge_jobid, None)
         # Resolve the actual log path now that we have the job ID
         log_stdout_resolved = logdir / f"{sge_jobid}.o"
         log_stderr_resolved = logdir / f"{sge_jobid}.e"
@@ -894,6 +908,13 @@ class Executor(RemoteExecutor):
                 f"for {kind} '{jobs[0].name}' "
                 f"(tasks {chunk_start}-{chunk_end}){hold_msg}."
             )
+
+            # Record the job→SGE-id mapping for the whole chunk BEFORE
+            # notifying Snakemake.  Each report_job_submission may unblock
+            # the scheduler, which can immediately call run_jobs again
+            # with downstream tasks that need to read these mappings.
+            for task_idx, job in enumerate(chunk_jobs, start=chunk_start):
+                self._job_to_sge[job] = (sge_jobid, task_idx)
 
             # Register each task with Snakemake
             for task_idx, job in enumerate(chunk_jobs, start=chunk_start):
