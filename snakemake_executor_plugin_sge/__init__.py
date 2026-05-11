@@ -113,19 +113,23 @@ class ExecutorSettings(ExecutorSettingsBase):
 
     # ---- Array jobs -------------------------------------------------------
 
-    group_jobs_as_array: bool = field(
-        default=True,
+    disable_group_jobs_as_array: bool = field(
+        default=False,
         metadata={
             "help": (
-                "Submit Snakemake group jobs as SGE array jobs (qsub -t 1-N). "
-                "This is the recommended setting: it reduces scheduler overhead "
-                "and keeps all tasks of a group in a single qsub submission. "
-                "Set to False to fall back to individual qsub calls per task."
+                "Disable submitting Snakemake group jobs as SGE array jobs. "
+                "By default, group jobs are submitted as array jobs (qsub -t 1-N), "
+                "which reduces scheduler overhead. Set this flag to fall back to "
+                "individual qsub calls per task."
             ),
             "env_var": False,
             "required": False,
         },
     )
+
+    @property
+    def group_jobs_as_array(self) -> bool:
+        return not self.disable_group_jobs_as_array
 
     array_limit: int = field(
         default=75000,
@@ -209,18 +213,22 @@ class ExecutorSettings(ExecutorSettingsBase):
         },
     )
 
-    use_qacct: bool = field(
-        default=True,
+    disable_qacct: bool = field(
+        default=False,
         metadata={
             "help": (
-                "Use qacct (accounting) in addition to qstat to detect "
-                "completed / failed jobs.  Disable if qacct is not available "
+                "Disable using qacct (accounting) in addition to qstat to detect "
+                "completed / failed jobs. Use this if qacct is not available "
                 "or is very slow on your cluster."
             ),
             "env_var": False,
             "required": False,
         },
     )
+
+    @property
+    def use_qacct(self) -> bool:
+        return not self.disable_qacct
 
     # ---- Misc -------------------------------------------------------------
 
