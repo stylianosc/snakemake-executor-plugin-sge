@@ -370,6 +370,8 @@ class Executor(RemoteExecutor):
     # ------------------------------------------------------------------
 
     def _report_submission_threadsafe(self, job_info: SubmittedJobInfo) -> None:
+        import time
+        self._submit_times[job_info.external_jobid] = time.time()
         if self._main_event_loop is not None:
             self._main_event_loop.call_soon_threadsafe(
                 self.report_job_submission, job_info
@@ -685,6 +687,7 @@ class Executor(RemoteExecutor):
                     active_jobs,
                     use_qacct=settings.use_qacct,
                     logger=self.logger,
+                    submit_times=self._submit_times,
                 )
                 if status_map is not None:
                     break

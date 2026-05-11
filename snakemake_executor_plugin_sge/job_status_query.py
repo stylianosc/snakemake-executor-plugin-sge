@@ -168,6 +168,7 @@ async def query_job_status(
     active_jobs,
     use_qacct: bool,
     logger,
+    submit_times: Optional[Dict[str, float]] = None,
 ) -> Optional[Dict[str, str]]:
     """Asynchronously query qstat (and optionally qacct) for all active jobs.
 
@@ -176,6 +177,7 @@ async def query_job_status(
 
     Returns ``None`` on complete query failure.
     """
+    import time
     job_ids = [j.external_jobid for j in active_jobs]
     if not job_ids:
         return {}
@@ -214,8 +216,15 @@ async def query_job_status(
                 # Not yet in qacct either → treat as still queued
                 pass  # jid absent from status_map → caller yields it
         else:
-            # qacct disabled or unavailable: assume finished when job
-            # disappears from qstat (optimistic assumption)
-            status_map[jid] = "finished"
+            # qacct disabled or unavailable.
+            # SGE takes a few seconds to register a job in qstat. If we poll qstat
+            # too early, it will return empty, and we might falsely assume the job
+            # finished instantly. We require at least 60 seconds to pass before assuming
+            # a missing job is finished.
+            submit_time = submit_times.get(jid, 0) if submit_times else 0
+            if time.time() - submit_time > 60:
+                status_map[jid] = "finished"
+            else:
+                pass  # treat as still queued
 
     return status_map
