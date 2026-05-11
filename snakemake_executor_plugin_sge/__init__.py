@@ -321,6 +321,20 @@ def _get_job_wildcards(job: JobExecutorInterface) -> str:
     return "__".join(parts)
 
 
+def _wildcard_sort_key(job: JobExecutorInterface):
+    """Return a stable sort key derived from a job's wildcards.
+
+    Used to assign deterministic SGE array task indices: two rules that
+    iterate the same wildcard space (e.g. {subject}) will produce the
+    same ordering, which is a precondition for -hold_jid_ad.
+    """
+    wc = getattr(job, "wildcards", None)
+    if not wc:
+        # Fall back to jobid so order is at least deterministic per run
+        return ((), getattr(job, "jobid", 0))
+    return (tuple(sorted((k, str(v)) for k, v in wc.items())), 0)
+
+
 # ---------------------------------------------------------------------------
 # Executor
 # ---------------------------------------------------------------------------
@@ -398,9 +412,16 @@ class Executor(RemoteExecutor):
     def run_jobs(self, jobs: List[JobExecutorInterface]) -> None:
         """Classify and dispatch incoming jobs.
 
-        - Individual (non-group) jobs → ``run_job``.
-        - Group jobs                   → ``run_array_job`` when
-          ``group_jobs_as_array`` is True, otherwise ``run_job`` each.
+        Strategy
+        --------
+        Regular (non-group) jobs from the same rule arriving in one batch are
+        bucketed and submitted as a single SGE array job (qsub -t).  This
+        dramatically reduces scheduler overhead when many instances of the
+        same rule are submitted at once (e.g. one task per subject under
+        --immediate-submit).  Single-instance rules become a 1-task array.
+
+        Group jobs follow the existing logic: bundled into a single array
+        when ``group_jobs_as_array`` is enabled, individually otherwise.
         """
         if self._main_event_loop is None:
             try:
@@ -408,14 +429,23 @@ class Executor(RemoteExecutor):
             except RuntimeError:
                 self._main_event_loop = None
 
-        # Separate group jobs from regular jobs
+        # Separate group jobs from regular jobs.  Regular jobs are bucketed
+        # by rule name and sorted by wildcards within each bucket so that
+        # task indices are deterministic AND consistent across rules that
+        # share the same wildcards (e.g. {subject}).  This is what enables
+        # -hold_jid_ad: when downstream task N is held on upstream task N,
+        # the two tasks must refer to the same logical unit.
         group_jobs: List[JobExecutorInterface] = []
-        regular_jobs: List[JobExecutorInterface] = []
+        # Use a dict to bucket regular jobs by rule name. Python preserves
+        # insertion order, so the first-seen rule is submitted first.
+        regular_buckets: "dict[str, List[JobExecutorInterface]]" = {}
         for job in jobs:
             if job.is_group():
                 group_jobs.append(job)
             else:
-                regular_jobs.append(job)
+                regular_buckets.setdefault(job.name, []).append(job)
+        for bucket in regular_buckets.values():
+            bucket.sort(key=_wildcard_sort_key)
 
         # With --immediate-submit, each report_job_submission call releases
         # the scheduler semaphore.  If we dispatch to threads, the scheduler
@@ -423,12 +453,14 @@ class Executor(RemoteExecutor):
         # concluding the workflow is stuck.  Submit synchronously instead.
         immediate = self.workflow.remote_execution_settings.immediate_submit
 
-        # Submit regular jobs individually
-        for job in regular_jobs:
+        # Submit each per-rule bucket as one array job.
+        for rule_name, bucket in regular_buckets.items():
             if immediate:
-                self.run_job(job)
+                self.run_array_job(bucket)
             else:
-                self._job_submission_executor.submit(self.run_job, job)
+                self._job_submission_executor.submit(
+                    self.run_array_job, bucket
+                )
 
         # Submit group jobs
         if group_jobs:
@@ -452,6 +484,123 @@ class Executor(RemoteExecutor):
     # ------------------------------------------------------------------
     # Single-job submission
     # ------------------------------------------------------------------
+
+    # Resource keys that materially affect SGE scheduling.  Differences in
+    # these across an array bucket are worth warning about; cosmetic
+    # resources like 'name' are intentionally excluded.
+    _ARRAY_RESOURCE_KEYS = (
+        "mem_mb",
+        "mem_mb_per_cpu",
+        "runtime",
+        "threads",
+        "sge_queue",
+        "sge_project",
+        "sge_pe",
+        "sge_resources",
+    )
+
+    def _warn_on_heterogeneous_resources(
+        self, jobs: List[JobExecutorInterface]
+    ) -> None:
+        """Warn if jobs in an array bucket differ in scheduling resources.
+
+        SGE applies one resource spec to every task in -t, so divergent
+        per-task requirements would be silently flattened to the first
+        job's values.
+        """
+        if len(jobs) < 2:
+            return
+        first = jobs[0]
+        differing: dict = {}
+        for key in self._ARRAY_RESOURCE_KEYS:
+            ref = first.resources.get(key)
+            for j in jobs[1:]:
+                if j.resources.get(key) != ref:
+                    differing.setdefault(key, set()).add(repr(ref))
+                    differing[key].add(repr(j.resources.get(key)))
+                    break
+        if differing:
+            summary = ", ".join(
+                f"{k}={{{', '.join(sorted(v))}}}" for k, v in differing.items()
+            )
+            self.logger.warning(
+                f"SGE array for rule '{first.name}' contains tasks with "
+                f"differing resources ({summary}). The first task's values "
+                f"will be applied to every task."
+            )
+
+    def _resolve_array_holds(
+        self,
+        chunk_jobs: List[JobExecutorInterface],
+        chunk_start: int,
+    ):
+        """Decide whether to hold this array chunk with -hold_jid_ad or -hold_jid.
+
+        Returns
+        -------
+        (hold_jid_ad, hold_jid_list)
+
+        ``hold_jid_ad`` is the base SGE job ID of a single upstream array
+        when every chunk task has exactly one upstream task and the
+        upstream task index matches the downstream task index (the
+        contract enforced by qsub's -hold_jid_ad).
+
+        Otherwise ``hold_jid_ad`` is None and ``hold_jid_list`` carries
+        all the upstream array job IDs to pass to plain -hold_jid (whole
+        upstream array(s) must finish first).
+        """
+        # Per-task upstream IDs (full external IDs like "12345.7")
+        per_task_ext: List[List[str]] = []
+        all_base_ids: List[str] = []  # for whole-array fallback
+        for j in chunk_jobs:
+            ext_ids: List[str] = []
+            try:
+                dag_deps = self.workflow.dag.dependencies.get(j, {})
+                for upstream_job in dag_deps:
+                    for eid in self.workflow.persistence.external_jobids(upstream_job):
+                        if eid is None:
+                            continue
+                        ext_ids.append(str(eid))
+                        base = str(eid).split(".")[0]
+                        if base not in all_base_ids:
+                            all_base_ids.append(base)
+            except Exception as exc:
+                self.logger.debug(
+                    f"Could not resolve deps for job {j.jobid}: {exc}"
+                )
+            per_task_ext.append(ext_ids)
+
+        if not all_base_ids:
+            return (None, [])
+
+        # -hold_jid_ad eligibility: every chunk task has exactly one
+        # upstream, all upstreams belong to the same array job, and the
+        # upstream task index equals the downstream task index.
+        if len(all_base_ids) != 1:
+            return (None, all_base_ids)
+        upstream_base = all_base_ids[0]
+
+        for offset, ext_ids in enumerate(per_task_ext):
+            if len(ext_ids) != 1:
+                return (None, all_base_ids)
+            up_id = ext_ids[0]
+            if "." not in up_id:
+                # Upstream was not submitted as an array; -hold_jid_ad
+                # would refuse it.  Fall back to whole-job hold.
+                return (None, all_base_ids)
+            base, _, up_task = up_id.partition(".")
+            if base != upstream_base:
+                return (None, all_base_ids)
+            try:
+                if int(up_task) != chunk_start + offset:
+                    return (None, all_base_ids)
+            except ValueError:
+                return (None, all_base_ids)
+
+        self.logger.debug(
+            f"Array chunk eligible for -hold_jid_ad on {upstream_base}"
+        )
+        return (upstream_base, [])
 
     def _resolve_sge_dependencies(self, job) -> List[str]:
         """Resolve upstream SGE job IDs for a given job.
@@ -565,6 +714,12 @@ class Executor(RemoteExecutor):
 
         The approach is identical to the SLURM plugin's ``run_array_jobs``
         method, adapted for SGE's ``qsub -t <start>-<end>`` syntax.
+
+        Both group jobs and same-rule regular-job buckets are supported.
+        All tasks in a single submission share one set of SGE resources
+        (queue, memory, runtime, etc.) taken from the first job in the
+        bucket -- callers should bucket jobs whose resources are
+        compatible (e.g. all instances of the same rule).
         """
         if not jobs:
             return
@@ -591,6 +746,28 @@ class Executor(RemoteExecutor):
         task_map_json = json.dumps(task_map)
         task_map_b64 = base64.b64encode(task_map_json.encode()).decode()
 
+        # Manifest: human-readable record of which task ID maps to which
+        # wildcards.  Aids debugging when scanning SGE log files.
+        manifest = {
+            str(idx): {
+                "snakemake_jobid": getattr(job, "jobid", None),
+                "wildcards": dict(job.wildcards) if getattr(job, "wildcards", None) else {},
+                "is_group": job.is_group(),
+            }
+            for idx, job in enumerate(jobs, start=1)
+        }
+        manifest_path = logdir / "task_manifest.json"
+        try:
+            manifest_path.write_text(json.dumps(manifest, indent=2))
+        except OSError as exc:
+            self.logger.debug(f"Could not write task manifest {manifest_path}: {exc}")
+
+        # SGE arrays share one resource spec across all tasks.  When the
+        # bucket contains jobs whose resources differ (e.g. per-wildcard
+        # mem_mb / runtime), the first job's values are applied to every
+        # task.  Warn so users notice silent over/under-allocation.
+        self._warn_on_heterogeneous_resources(jobs)
+
         settings = self.workflow.executor_settings
         array_limit = settings.array_limit
         n_tasks = len(jobs)
@@ -602,10 +779,11 @@ class Executor(RemoteExecutor):
             # Build the submission script
             # The script reads SGE_TASK_ID, extracts the matching command
             # from the task map, decompresses it, and executes it.
+            kind = "group" if jobs[0].is_group() else "rule"
             script_lines = [
                 "#!/bin/bash",
                 "set -euo pipefail",
-                f"# SGE array job for Snakemake group '{jobs[0].name}'",
+                f"# SGE array job for Snakemake {kind} '{jobs[0].name}'",
                 f"# run_uuid={self.run_uuid}",
                 "",
                 "# Task map: base64(JSON({task_id: base64(zlib(cmd))}))",
@@ -642,6 +820,22 @@ class Executor(RemoteExecutor):
                 "task_map_b64": task_map_b64,
             }
 
+            # Resolve cross-array dependencies.  Two cases:
+            #
+            #   1. Per-task 1:1 matching across a single upstream array
+            #      (e.g. run_bamos_correction[N] -> run_bamos[N], one
+            #      subject per task).  → use SGE's -hold_jid_ad so a
+            #      downstream task starts the moment its specific
+            #      upstream task finishes, instead of waiting for the
+            #      whole upstream array.
+            #
+            #   2. Anything else (multiple upstream arrays, or task
+            #      indices that don't line up).  → fall back to
+            #      -hold_jid (whole-array hold).
+            hold_ad_id, hold_ids = self._resolve_array_holds(
+                chunk_jobs, chunk_start
+            )
+
             call = get_submit_command(
                 chunk_jobs[0],
                 job_params,
@@ -649,6 +843,8 @@ class Executor(RemoteExecutor):
                 exec_cmd=None,  # command is in script
                 script_path=str(script_path),
                 is_array=True,
+                hold_jid_list=hold_ids,
+                hold_jid_ad_override=hold_ad_id,
             )
 
             self.logger.debug(f"qsub array call: {call}")
@@ -688,10 +884,15 @@ class Executor(RemoteExecutor):
                 continue
 
             self._submitted_job_ids.append(sge_jobid)
+            hold_msg = ""
+            if hold_ad_id:
+                hold_msg = f" -hold_jid_ad {hold_ad_id}"
+            elif hold_ids:
+                hold_msg = f" -hold_jid {','.join(hold_ids)}"
             self.logger.info(
                 f"Submitted SGE array job {sge_jobid} "
-                f"for group '{jobs[0].name}' "
-                f"(tasks {chunk_start}-{chunk_end})."
+                f"for {kind} '{jobs[0].name}' "
+                f"(tasks {chunk_start}-{chunk_end}){hold_msg}."
             )
 
             # Register each task with Snakemake

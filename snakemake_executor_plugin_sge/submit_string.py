@@ -68,6 +68,7 @@ def get_submit_command(
     script_path: Optional[str] = None,
     is_array: bool = False,
     hold_jid_list: Optional[list] = None,
+    hold_jid_ad_override: Optional[str] = None,
 ) -> str:
     """Return the complete qsub command string.
 
@@ -88,6 +89,13 @@ def get_submit_command(
         Path to the already-written bash submission script.
     is_array:
         Whether this is an array job.
+    hold_jid_list:
+        Auto-resolved whole-array upstream job IDs (passed via -hold_jid).
+        Used when downstream tasks must wait for entire upstream arrays.
+    hold_jid_ad_override:
+        Single upstream array job ID passed via -hold_jid_ad. When set,
+        task N of this array waits only on task N of the upstream array.
+        Takes precedence over settings.hold_jid_ad.
     """
     log_dir   = Path(params.get("log_dir") or str(params.get("log_stdout", "")).rsplit("/", 1)[0])
     run_uuid  = params.get("run_uuid", "0000")
@@ -233,19 +241,27 @@ def get_submit_command(
         call += f" -M {_safe(mail_addr)}"
 
     # ── job hold ──────────────────────────────────────────────────
-    # Priority: explicit resource/setting > auto-resolved from DAG
+    # Priority: explicit resource/setting > auto-resolved override > whole-array fallback.
+    #
+    # When hold_jid_ad_override is set, this submission is an array whose
+    # per-task dependencies map 1:1 onto an upstream array.  In that case
+    # -hold_jid_ad is sufficient by itself; emitting an additional
+    # -hold_jid on the same upstream array would be redundant and could
+    # cause the scheduler to wait for the entire upstream array even
+    # when individual tasks finish early.
     hold_jid = (
         job.resources.get("sge_hold_jid")
         or getattr(settings, "hold_jid", None)
     )
     if hold_jid:
         call += f" -hold_jid {_safe(str(hold_jid))}"
-    elif hold_jid_list:
+    elif hold_jid_list and not hold_jid_ad_override:
         # Auto-resolved dependencies from Snakemake DAG (--immediate-submit)
         call += f" -hold_jid {','.join(hold_jid_list)}"
 
     hold_jid_ad = (
         job.resources.get("sge_hold_jid_ad")
+        or hold_jid_ad_override
         or getattr(settings, "hold_jid_ad", None)
     )
     if hold_jid_ad:
