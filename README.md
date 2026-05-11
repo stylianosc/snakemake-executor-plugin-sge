@@ -1,19 +1,25 @@
 # snakemake-executor-plugin-sge
 
-A [Snakemake](https://snakemake.readthedocs.io) executor plugin for submitting
-jobs to **Sun Grid Engine** (SGE), **Univa Grid Engine** (UGE), and
-**Open Grid Scheduler** (OGS) clusters.
+A [Snakemake](https://snakemake.readthedocs.io) executor plugin for
+**Sun Grid Engine (SGE)**, **Univa Grid Engine (UGE)**, and
+**Open Grid Scheduler (OGS)** clusters.
 
 ## Features
 
-- Native `qsub` / `qstat` / `qdel` integration
-- **Group jobs are submitted as SGE array jobs** (`-t 1-N`), reducing scheduler
-  overhead and allowing the cluster to manage task parallelism
-- Comprehensive resource mapping: CPU threads, memory (`h_vmem`), walltime
-  (`h_rt`), parallel environment (`-pe`), queue (`-q`), project (`-P`)
-- Optional `sge_extra` pass-through for any extra `qsub` flags
-- Automatic log directory management with configurable retention
-- Clean cancellation of all active jobs on interrupt
+- **Every job is an array job** – singletons become `-t 1-1`, batches become
+  `-t 1-N`. One submission path, one tracking path, no special cases.
+- **Group jobs as a single array job** – Snakemake group jobs (several rules
+  bundled together) are submitted as one qsub call.
+- **Rich qsub flag coverage** – queue, project, parallel environment, wall
+  time, memory (per-slot and total), priority, requeue, reservation, notify,
+  mail, hold_jid, task concurrency, env-var export, join logs, and arbitrary
+  extra flags.
+- **Per-rule resource overrides** – any global setting can be overridden via
+  rule `resources:` (e.g. `sge_queue`, `sge_pe`, `sge_extra`, …).
+- **Two-stage status polling** – `qstat` for in-flight jobs, `qacct` for
+  completed jobs; configurable retries and optional qacct disabling.
+- **Clean log management** – per-task stdout/stderr, optional auto-delete on
+  success, age-based rotation.
 
 ## Installation
 
@@ -21,54 +27,69 @@ jobs to **Sun Grid Engine** (SGE), **Univa Grid Engine** (UGE), and
 pip install snakemake-executor-plugin-sge
 ```
 
-## Usage
+## Quick start
 
 ```bash
 snakemake --executor sge --jobs 100
 ```
 
-### Common options
+## Common options
 
-| Flag | Description |
-|---|---|
-| `--sge-queue` | SGE queue to submit jobs to |
-| `--sge-pe` | Parallel environment name for multi-threaded jobs |
-| `--sge-project` | SGE project (`-P`) |
-| `--sge-logdir` | Override default log directory |
-| `--sge-keep-successful-logs` | Keep log files for successful jobs |
-| `--sge-group-jobs-as-array` | Submit group jobs as array jobs (default: true) |
-| `--sge-array-limit` | Max tasks per single `qsub -t` call (default: 75000) |
+| CLI flag | Default | Description |
+|---|---|---|
+| `--sge-queue` | — | Default queue (`-q`) |
+| `--sge-pe` | — | Parallel environment for multi-thread jobs |
+| `--sge-project` | — | Project (`-P`) |
+| `--sge-export-env` | `True` | Export environment (`-V`) |
+| `--sge-join-logs` | `False` | Merge stdout+stderr (`-j y`) |
+| `--sge-requeue` | — | Requeue on failure (`-r y/n`) |
+| `--sge-reservation` | — | Resource reservation (`-R y/n`) |
+| `--sge-notify` | `False` | Send notify signal |
+| `--sge-mail-on` | — | Mail events (`b`, `e`, `a`, `s`, `n`) |
+| `--sge-mail-address` | — | Mail address (`-M`) |
+| `--sge-hold-jid` | — | Hold until job(s) finish |
+| `--sge-array-limit` | `75000` | Max tasks per `qsub -t` call |
+| `--sge-task-concurrency` | — | Max concurrent array tasks (`-tc`) |
+| `--sge-logdir` | `.snakemake/sge_logs` | Log directory |
+| `--sge-keep-successful-logs` | `False` | Keep logs for successful jobs |
+| `--sge-use-qacct` | `True` | Use `qacct` for finished-job detection |
+| `--sge-extra` | — | Raw extra qsub flags (global) |
+| `--sge-jobname-prefix` | — | Prefix for SGE job names |
 
-### Resource directives
-
-In your `Snakefile` rules use:
+## Per-rule resource overrides
 
 ```python
-rule example:
-    input: ...
-    output: ...
+rule my_rule:
     resources:
-        runtime=60,          # wall time in minutes (h_rt)
-        mem_mb=4096,         # memory in MB (h_vmem)
-        threads=4,           # CPUs (mapped to -pe <pe> <threads>)
-        sge_queue="highmem", # override queue per rule
-        sge_project="myproj",# override project per rule
-        sge_extra="-l gpu=1" # any extra qsub flags
+        runtime        = 120,          # minutes → h_rt=02:00:00
+        mem_mb         = 8192,         # total memory (divided by threads per slot)
+        mem_mb_per_cpu = 2048,         # per-slot memory (takes precedence)
+        threads        = 4,
+        sge_queue      = "highmem.q",
+        sge_pe         = "smp",
+        sge_project    = "myproject",
+        sge_extra      = "-l gpu=1",   # arbitrary extra qsub flags
+        sge_resources  = {"h_cpu": "24:00:00", "arch": "lx-amd64"},
+        sge_join_logs  = True,
+        sge_requeue    = True,
+        sge_priority   = -100,
+        sge_notify     = True,
+        sge_mail_on    = "e",
+        sge_mail_address = "me@example.com",
+        sge_hold_jid   = "12345",
+        sge_task_concurrency = 8,
+        sge_export_env = False,
     threads: 4
     shell: "..."
 ```
 
-## Array-job behaviour for group jobs
+## Array-job design
 
-When Snakemake creates a **group job** (i.e. multiple rules merged into a
-single submission), this plugin packages all tasks into a single
-`qsub -t 1-N` array job.  Each array task receives its command via the
-`SGE_TASK_ID` environment variable, which is used to index into a compressed
-task map embedded in the submission script.
-
-This is functionally equivalent to how
-[snakemake-executor-plugin-slurm](https://github.com/snakemake/snakemake-executor-plugin-slurm)
-handles SLURM array jobs.
+Every qsub submission uses `qsub -t start-end`.  Execution commands are
+stored in a JSON file on the shared filesystem before `qsub` is called.  The
+submission script reads `$SGE_TASK_ID`, looks up the compressed command, and
+evaluates it.  This avoids command-line length limits and all heredoc/quoting
+problems.
 
 ## License
 

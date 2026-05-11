@@ -1,19 +1,39 @@
-"""Build the qsub command string for SGE/UGE/OGS job submission.
+"""
+Build the qsub command string for SGE/UGE/OGS.
 
-SGE command-line reference (key flags used here)
--------------------------------------------------
-  -N <name>          Job name
-  -o <path>          Standard output file
-  -e <path>          Standard error file
-  -q <queue>         Queue / queue list
-  -pe <pe> <slots>   Parallel environment (multi-threaded jobs)
-  -P <project>       Project
-  -l h_rt=HH:MM:SS   Hard wall-clock time limit
-  -l h_vmem=<size>   Hard virtual memory limit per slot
-  -V                 Export all environment variables
-  -wd <dir>          Working directory
-  -t <start>-<end>   Array-job task range
-  -tc <concurrency>  Max concurrently running array tasks (optional)
+Every job – whether a single rule invocation, a rule batch, or a Snakemake
+group job – is always submitted as an array job (qsub -t start-end).  For a
+single task this becomes -t 1-1.  The execution commands for each task are
+stored in a JSON file on the shared filesystem, written at submission time.
+The submission script reads that file keyed on $SGE_TASK_ID, decompresses
+the command, and evaluates it.  This avoids command-line length limits and
+heredoc/quoting issues.
+
+SGE flags covered
+─────────────────
+  -N  <name>               Job name
+  -o  <path>               Stdout path  (directory – SGE appends job/task id)
+  -e  <path>               Stderr path
+  -j  y|n                  Merge stdout+stderr
+  -cwd / -wd <dir>         Working directory
+  -V  / -v VAR=val         Export environment
+  -S  /bin/bash            Shell
+  -q  <queue>              Queue / queue-list
+  -P  <project>            Project
+  -pe <pe> <slots>         Parallel environment (multi-thread)
+  -l  h_rt=HH:MM:SS        Hard wall-clock limit
+  -l  h_vmem=<N>M|G        Hard virtual-memory per slot
+  -l  <key>=<val>          Any extra -l resource (sge_resources dict)
+  -p  <priority>           Job priority  (-1023 … 1024)
+  -r  y|n                  Requeue after failure
+  -R  y|n                  Resource reservation
+  -notify                  Send USR1/USR2 before KILL/STOP
+  -m  <flags>              Mail on: b, e, a, s, n
+  -M  <address>            Mail address
+  -hold_jid <id>,...       Hold until these jobs finish
+  -tc <N>                  Max concurrently running array tasks
+  -t  <start>-<end>        Array task range
+  <extra>                  sge_extra / --sge-extra pass-through
 """
 
 import shlex
@@ -22,128 +42,216 @@ from typing import Optional
 
 
 def _fmt_runtime(minutes: int) -> str:
-    """Convert integer minutes to SGE h_rt format HH:MM:SS."""
-    h = minutes // 60
-    m = minutes % 60
+    """Convert integer minutes → 'HH:MM:SS' for h_rt."""
+    h, m = divmod(int(minutes), 60)
     return f"{h:02d}:{m:02d}:00"
 
 
 def _fmt_mem(mem_mb: int) -> str:
-    """Convert integer MB to a qsub-friendly string (e.g. '4096M')."""
+    """Convert MB → 'NG' when evenly divisible, else 'NM'."""
+    mem_mb = int(mem_mb)
     if mem_mb >= 1024 and mem_mb % 1024 == 0:
         return f"{mem_mb // 1024}G"
     return f"{mem_mb}M"
+
+
+def _safe(value) -> str:
+    """shlex-quote a value, converting to str first."""
+    return shlex.quote(str(value))
 
 
 def get_submit_command(
     job,
     params: dict,
     settings,
-    exec_cmd: Optional[str],
-    script_path: Optional[str] = None,
-    is_array: bool = False,
+    script_path: str,
+    array_range: str,
 ) -> str:
-    """Return the full qsub command string for *job*.
+    """Return the complete qsub command string.
 
     Parameters
     ----------
     job:
-        Snakemake job object (provides ``.resources``, ``.name``, etc.)
+        Snakemake JobExecutorInterface (provides .resources, .name, etc.)
     params:
-        Dictionary of submission parameters::
-
-            run_uuid      – unique ID for the whole Snakemake run
-            log_stdout    – stdout log path (may contain $JOB_ID placeholders)
-            log_stderr    – stderr log path
-            workdir       – workflow working directory
-            array_range   – (array only) "start-end" string, e.g. "1-50"
-            task_map_b64  – (array only) base64-encoded task map
-
+        run_uuid    – unique ID for the whole Snakemake run
+        log_dir     – directory for stdout/stderr logs
+        workdir     – workflow working directory
     settings:
-        ``ExecutorSettings`` instance from the plugin.
-    exec_cmd:
-        The shell command to execute (for single jobs). ``None`` for array
-        jobs where the command is in *script_path*.
+        ExecutorSettings instance.
     script_path:
-        Path to the submission script (array jobs).
-    is_array:
-        Whether this is an array job submission.
+        Path to the already-written bash submission script.
+    array_range:
+        SGE array range string, e.g. '1-50' or '1-1'.
     """
-    # ----- Job name -------------------------------------------------------
-    # SGE job names must start with a letter and contain no spaces.
-    # We use the run UUID and truncate to 64 characters (SGE default limit).
-    job_name = f"sm_{params['run_uuid']}"[:64]
+    log_dir   = Path(params["log_dir"])
+    run_uuid  = params["run_uuid"]
+    workdir   = params.get("workdir", "")
 
-    call = (
-        f"qsub"
-        f" -V"
-        f" -N {shlex.quote(job_name)}"
-        f" -o {shlex.quote(str(params['log_stdout']))}"
-        f" -e {shlex.quote(str(params['log_stderr']))}"
+    # ── job name (max 64 chars, must start with letter) ────────────────────
+    # 'sm_' prefix ensures we never start with a digit.
+    job_name = f"sm_{run_uuid}"[:64]
+
+    # ── merge logs? ─────────────────────────────────────────────────
+    join_logs = bool(
+        job.resources.get("sge_join_logs")
+        if job.resources.get("sge_join_logs") is not None
+        else getattr(settings, "join_logs", False)
     )
 
-    # ----- Working directory ----------------------------------------------
-    if params.get("workdir"):
-        call += f" -wd {shlex.quote(str(params['workdir']))}"
+    # ── assemble call ─────────────────────────────────────────────────
+    call = (
+        f"qsub"
+        f" -S /bin/bash"
+        f" -N {_safe(job_name)}"
+    )
 
-    # ----- Queue ----------------------------------------------------------
-    # Per-rule resource takes precedence over the global setting
-    queue = job.resources.get("sge_queue") or settings.queue
+    # Stdout/stderr: pass the log *directory*; SGE appends .oJOBID.TASKID
+    # Use -o dir/ -e dir/ (trailing slash = treat as directory on most SGE)
+    call += f" -o {_safe(str(log_dir) + '/')}"
+    if join_logs:
+        call += " -j y"
+    else:
+        call += f" -e {_safe(str(log_dir) + '/')}"
+
+    # ── working directory ──────────────────────────────────────────────
+    if workdir:
+        call += f" -wd {_safe(workdir)}"
+    else:
+        call += " -cwd"
+
+    # ── environment export ───────────────────────────────────────────
+    export_env = (
+        job.resources.get("sge_export_env")
+        if job.resources.get("sge_export_env") is not None
+        else getattr(settings, "export_env", True)
+    )
+    if export_env:
+        call += " -V"
+    extra_envvars = getattr(settings, "extra_envvars", None)
+    if extra_envvars:
+        for kv in extra_envvars.split(","):
+            kv = kv.strip()
+            if kv:
+                call += f" -v {_safe(kv)}"
+
+    # ── queue ───────────────────────────────────────────────────────
+    queue = job.resources.get("sge_queue") or getattr(settings, "queue", None)
     if queue:
-        call += f" -q {shlex.quote(str(queue))}"
+        call += f" -q {_safe(queue)}"
 
-    # ----- Project --------------------------------------------------------
-    project = job.resources.get("sge_project") or settings.project
+    # ── project ───────────────────────────────────────────────────
+    project = job.resources.get("sge_project") or getattr(settings, "project", None)
     if project:
-        call += f" -P {shlex.quote(str(project))}"
+        call += f" -P {_safe(project)}"
 
-    # ----- Parallel environment (threads) ---------------------------------
-    threads = job.resources.get("threads", 1)
-    pe = job.resources.get("sge_pe") or settings.pe
+    # ── parallel environment / threads ────────────────────────────────
+    threads = int(job.resources.get("threads", 1))
+    pe = job.resources.get("sge_pe") or getattr(settings, "pe", None)
     if threads > 1:
         if pe:
-            call += f" -pe {shlex.quote(str(pe))} {int(threads)}"
+            call += f" -pe {_safe(pe)} {threads}"
         else:
-            # Still set the slots via -l to give the scheduler a hint
-            call += f" -l slots={int(threads)}"
-    else:
-        # Single-threaded: no PE needed, but honour explicit -pe if given
-        if pe:
-            call += f" -pe {shlex.quote(str(pe))} 1"
+            call += f" -l slots={threads}"
+    elif pe:
+        call += f" -pe {_safe(pe)} 1"
 
-    # ----- Wall-clock time ------------------------------------------------
+    # ── wall-clock time ─────────────────────────────────────────────
     runtime_minutes = job.resources.get("runtime")
     if runtime_minutes is not None:
-        call += f" -l h_rt={_fmt_runtime(int(runtime_minutes))}"
+        call += f" -l h_rt={_fmt_runtime(runtime_minutes)}"
 
-    # ----- Memory ---------------------------------------------------------
-    mem_mb = job.resources.get("mem_mb")
+    # ── memory ────────────────────────────────────────────────────
     mem_mb_per_cpu = job.resources.get("mem_mb_per_cpu")
+    mem_mb         = job.resources.get("mem_mb")
     if mem_mb_per_cpu:
-        # SGE h_vmem is per-slot, so mem_mb_per_cpu maps directly
-        call += f" -l h_vmem={_fmt_mem(int(mem_mb_per_cpu))}"
+        call += f" -l h_vmem={_fmt_mem(mem_mb_per_cpu)}"
     elif mem_mb:
-        # Convert total memory to per-slot
-        per_slot_mb = max(1, int(mem_mb) // max(1, threads))
-        call += f" -l h_vmem={_fmt_mem(per_slot_mb)}"
+        per_slot = max(1, int(mem_mb) // max(1, threads))
+        call += f" -l h_vmem={_fmt_mem(per_slot)}"
 
-    # ----- Array job range ------------------------------------------------
-    if is_array and params.get("array_range"):
-        call += f" -t {params['array_range']}"
+    # ── extra -l resources (dict of key→value) ────────────────────────
+    sge_resources = job.resources.get("sge_resources") or {}
+    if isinstance(sge_resources, str):
+        sge_resources = dict(
+            kv.split("=", 1)
+            for kv in sge_resources.split(",")
+            if "=" in kv
+        )
+    for k, v in sge_resources.items():
+        call += f" -l {_safe(k)}={_safe(v)}"
 
-    # ----- Extra qsub flags (per-rule passthrough) -----------------------
-    sge_extra = job.resources.get("sge_extra")
+    # ── priority ───────────────────────────────────────────────────
+    priority = job.resources.get("sge_priority") or getattr(settings, "priority", None)
+    if priority is not None:
+        call += f" -p {int(priority)}"
+
+    # ── requeue ──────────────────────────────────────────────────
+    requeue = (
+        job.resources.get("sge_requeue")
+        if job.resources.get("sge_requeue") is not None
+        else getattr(settings, "requeue", None)
+    )
+    if requeue is not None:
+        call += f" -r {'y' if requeue else 'n'}"
+
+    # ── reservation ───────────────────────────────────────────────
+    reservation = (
+        job.resources.get("sge_reservation")
+        if job.resources.get("sge_reservation") is not None
+        else getattr(settings, "reservation", None)
+    )
+    if reservation is not None:
+        call += f" -R {'y' if reservation else 'n'}"
+
+    # ── notify ────────────────────────────────────────────────────
+    notify = (
+        job.resources.get("sge_notify")
+        if job.resources.get("sge_notify") is not None
+        else getattr(settings, "notify", False)
+    )
+    if notify:
+        call += " -notify"
+
+    # ── mail ──────────────────────────────────────────────────────
+    mail_on = (
+        job.resources.get("sge_mail_on")
+        or getattr(settings, "mail_on", None)
+    )
+    if mail_on:
+        call += f" -m {_safe(mail_on)}"
+    mail_addr = (
+        job.resources.get("sge_mail_address")
+        or getattr(settings, "mail_address", None)
+    )
+    if mail_addr:
+        call += f" -M {_safe(mail_addr)}"
+
+    # ── job hold ──────────────────────────────────────────────────
+    hold_jid = (
+        job.resources.get("sge_hold_jid")
+        or getattr(settings, "hold_jid", None)
+    )
+    if hold_jid:
+        call += f" -hold_jid {_safe(str(hold_jid))}"
+
+    # ── max concurrent array tasks ───────────────────────────────────
+    task_concurrency = (
+        job.resources.get("sge_task_concurrency")
+        or getattr(settings, "task_concurrency", None)
+    )
+    if task_concurrency is not None:
+        call += f" -tc {int(task_concurrency)}"
+
+    # ── array range (always present, even for singletons: -t 1-1) ────────
+    call += f" -t {array_range}"
+
+    # ── extra qsub flags (per-rule or global) ──────────────────────────
+    sge_extra = job.resources.get("sge_extra") or getattr(settings, "extra", None)
     if sge_extra:
         call += f" {sge_extra}"
 
-    # ----- Command / script -----------------------------------------------
-    if script_path:
-        # Array job: pass the pre-written script
-        call += f" {shlex.quote(script_path)}"
-    elif exec_cmd:
-        # Single job: use -b y to pass a command string directly,
-        # or wrap in a heredoc via /dev/stdin
-        escaped = exec_cmd.replace('"', '\\"')
-        call += f' -b y {shlex.quote(exec_cmd)}'
+    # ── submission script ───────────────────────────────────────────────
+    call += f" {_safe(script_path)}"
 
     return call
