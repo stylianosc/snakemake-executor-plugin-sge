@@ -239,6 +239,13 @@ def get_submit_command(
     if hold_jid:
         call += f" -hold_jid {_safe(str(hold_jid))}"
 
+    hold_jid_ad = (
+        job.resources.get("sge_hold_jid_ad")
+        or getattr(settings, "hold_jid_ad", None)
+    )
+    if hold_jid_ad:
+        call += f" -hold_jid_ad {_safe(str(hold_jid_ad))}"
+
     # ── max concurrent array tasks ───────────────────────────────────
     task_concurrency = (
         job.resources.get("sge_task_concurrency")

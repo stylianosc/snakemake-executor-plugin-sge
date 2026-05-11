@@ -186,6 +186,24 @@ class ExecutorSettings(ExecutorSettingsBase):
         },
     )
 
+    hold_jid: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Hold this job until the specified SGE job IDs have finished.",
+            "env_var": False,
+            "required": False,
+        },
+    )
+
+    hold_jid_ad: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Hold this array job until the corresponding array tasks of the specified SGE job IDs have finished.",
+            "env_var": False,
+            "required": False,
+        },
+    )
+
     # ---- Status polling ---------------------------------------------------
 
     init_seconds_before_status_checks: int = field(
