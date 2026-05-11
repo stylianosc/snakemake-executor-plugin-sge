@@ -41,10 +41,34 @@ from pathlib import Path
 from typing import Optional
 
 
-def _fmt_runtime(minutes: int) -> str:
-    """Convert integer minutes → 'HH:MM:SS' for h_rt."""
-    h, m = divmod(int(minutes), 60)
-    return f"{h:02d}:{m:02d}:00"
+def _fmt_runtime(value) -> str:
+    """Normalise a runtime value to 'HH:MM:SS' for SGE's h_rt.
+
+    Accepts:
+      - int / numeric: interpreted as minutes (Snakemake convention).
+      - str 'HH:MM:SS' or 'HH:MM' or 'MM': kept as-is after parsing.
+      - str of digits ('20'): treated as minutes.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        total_min = int(value)
+        h, m = divmod(total_min, 60)
+        return f"{h:02d}:{m:02d}:00"
+    s = str(value).strip()
+    if s.isdigit():
+        total_min = int(s)
+        h, m = divmod(total_min, 60)
+        return f"{h:02d}:{m:02d}:00"
+    parts = s.split(":")
+    if len(parts) == 3:
+        h, m, sec = parts
+        return f"{int(h):02d}:{int(m):02d}:{int(sec):02d}"
+    if len(parts) == 2:
+        h, m = parts
+        return f"{int(h):02d}:{int(m):02d}:00"
+    # Last-ditch passthrough; let SGE complain if invalid.
+    return s
 
 
 def _fmt_mem(mem_mb: int) -> str:
@@ -134,10 +158,16 @@ def get_submit_command(
         call += " -cwd"
 
     # ── environment export ───────────────────────────────────────────
+    # By default we do NOT pass -V: the submitted command already
+    # includes a full snakemake invocation with all the environment it
+    # needs, and inheriting the entire login shell environment can
+    # mask issues or accidentally leak credentials onto compute nodes.
+    # Opt in per-rule via resources.sge_export_env=True or globally via
+    # --sge-export-env.
     export_env = (
         job.resources.get("sge_export_env")
         if job.resources.get("sge_export_env") is not None
-        else getattr(settings, "export_env", True)
+        else getattr(settings, "export_env", False)
     )
     if export_env:
         call += " -V"
@@ -170,18 +200,42 @@ def get_submit_command(
         call += f" -pe {_safe(pe)} 1"
 
     # ── wall-clock time ─────────────────────────────────────────────
-    runtime_minutes = job.resources.get("runtime")
-    if runtime_minutes is not None:
-        call += f" -l h_rt={_fmt_runtime(runtime_minutes)}"
+    # Accept either Snakemake's `runtime` (minutes) or a free-form
+    # `time` resource that can be 'HH:MM:SS' / 'HH:MM' / minutes.
+    runtime_raw = job.resources.get("runtime")
+    if runtime_raw is None:
+        runtime_raw = job.resources.get("time")
+    runtime_fmt = _fmt_runtime(runtime_raw)
+    if runtime_fmt is not None:
+        call += f" -l h_rt={runtime_fmt}"
 
     # ── memory ────────────────────────────────────────────────────
+    # SGE clusters typically gate on both h_vmem (virtual memory) AND
+    # tmem (RAM, used by UCL's CS cluster).  Emit both from mem_mb so
+    # users don't have to specify h_vmem / tmem separately.  Users can
+    # still override either via sge_resources={'h_vmem': ..., 'tmem': ...}.
     mem_mb_per_cpu = job.resources.get("mem_mb_per_cpu")
     mem_mb         = job.resources.get("mem_mb")
     if mem_mb_per_cpu:
-        call += f" -l h_vmem={_fmt_mem(mem_mb_per_cpu)}"
+        mem_per_slot_str = _fmt_mem(mem_mb_per_cpu)
     elif mem_mb:
         per_slot = max(1, int(mem_mb) // max(1, threads))
-        call += f" -l h_vmem={_fmt_mem(per_slot)}"
+        mem_per_slot_str = _fmt_mem(per_slot)
+    else:
+        mem_per_slot_str = None
+    if mem_per_slot_str is not None:
+        call += f" -l h_vmem={mem_per_slot_str}"
+        call += f" -l tmem={mem_per_slot_str}"
+
+    # ── scratch (temporary local disk) ────────────────────────────────
+    # Snakemake convention: `disk_mb` / `scratch_size` in MB → tscratch.
+    scratch_mb = (
+        job.resources.get("tscratch")
+        or job.resources.get("scratch_size")
+        or job.resources.get("disk_mb")
+    )
+    if scratch_mb is not None:
+        call += f" -l tscratch={_fmt_mem(scratch_mb)}"
 
     # ── extra -l resources (dict of key→value) ────────────────────────
     sge_resources = job.resources.get("sge_resources") or {}
