@@ -767,7 +767,7 @@ class Executor(RemoteExecutor):
             return
         cutoff_secs = age_cutoff * 86400
         now = time.time()
-        self.logger.info(
+        self.logger.debug(
             f"Cleaning SGE log files older than {age_cutoff} day(s)."
         )
         for path in self.sge_logdir.rglob("*"):
