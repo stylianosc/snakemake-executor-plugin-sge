@@ -170,13 +170,7 @@ async def query_job_status(
     logger,
     submit_times: Optional[Dict[str, float]] = None,
 ) -> Optional[Dict[str, str]]:
-    """Asynchronously query qstat (and optionally qacct) for all active jobs.
-
-    Returns a dict ``{external_jobid: status}`` where status is one of
-    ``'running'``, ``'finished'``, ``'failed'``.
-
-    Returns ``None`` on complete query failure.
-    """
+    """Asynchronously query qstat (and optionally qacct) for all active jobs."""
     import time
     job_ids = [j.external_jobid for j in active_jobs]
     if not job_ids:
@@ -185,7 +179,6 @@ async def query_job_status(
     loop = asyncio.get_event_loop()
 
     try:
-        # qstat for currently running / queued jobs
         qstat_status = await loop.run_in_executor(
             None, _poll_qstat, job_ids, logger
         )
@@ -196,11 +189,20 @@ async def query_job_status(
     status_map: Dict[str, str] = {}
 
     for jid in job_ids:
+        # qstat is the ground truth for currently running jobs
         if jid in qstat_status:
             status_map[jid] = qstat_status[jid]
             continue
 
-        # Job not in qstat → it has left the queue; check qacct
+        # If it's not in qstat, it might have finished or hasn't appeared yet.
+        # Check grace period first!
+        submit_time = submit_times.get(jid, 0) if submit_times else 0
+        if time.time() - submit_time < 60:
+            # Job is too young to be considered finished, even if it's not in qstat
+            # or if qacct returns an old reused job ID.
+            continue  # leave it absent from status_map -> treats as queued/running
+
+        # Job is old enough. We can now trust qacct or assume it's finished.
         if use_qacct and is_qacct_available():
             try:
                 acct_status = await loop.run_in_executor(
@@ -213,18 +215,10 @@ async def query_job_status(
             if acct_status is not None:
                 status_map[jid] = acct_status
             else:
-                # Not yet in qacct either → treat as still queued
-                pass  # jid absent from status_map → caller yields it
+                pass
         else:
-            # qacct disabled or unavailable.
-            # SGE takes a few seconds to register a job in qstat. If we poll qstat
-            # too early, it will return empty, and we might falsely assume the job
-            # finished instantly. We require at least 60 seconds to pass before assuming
-            # a missing job is finished.
-            submit_time = submit_times.get(jid, 0) if submit_times else 0
-            if time.time() - submit_time > 60:
-                status_map[jid] = "finished"
-            else:
-                pass  # treat as still queued
+            # qacct disabled or unavailable: assume finished since it's old enough
+            # and no longer in qstat.
+            status_map[jid] = "finished"
 
     return status_map
