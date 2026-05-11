@@ -417,22 +417,37 @@ class Executor(RemoteExecutor):
             else:
                 regular_jobs.append(job)
 
+        # With --immediate-submit, each report_job_submission call releases
+        # the scheduler semaphore.  If we dispatch to threads, the scheduler
+        # can race ahead before all jobs in this batch are registered,
+        # concluding the workflow is stuck.  Submit synchronously instead.
+        immediate = self.workflow.remote_execution_settings.immediate_submit
+
         # Submit regular jobs individually
         for job in regular_jobs:
-            self._job_submission_executor.submit(self.run_job, job)
+            if immediate:
+                self.run_job(job)
+            else:
+                self._job_submission_executor.submit(self.run_job, job)
 
         # Submit group jobs
         if group_jobs:
             settings = self.workflow.executor_settings
             if settings.group_jobs_as_array and len(group_jobs) > 1:
                 # Package all group tasks as a single array job
-                self._job_submission_executor.submit(
-                    self.run_array_job, group_jobs
-                )
+                if immediate:
+                    self.run_array_job(group_jobs)
+                else:
+                    self._job_submission_executor.submit(
+                        self.run_array_job, group_jobs
+                    )
             else:
                 # Fallback: submit each group job task individually
                 for job in group_jobs:
-                    self._job_submission_executor.submit(self.run_job, job)
+                    if immediate:
+                        self.run_job(job)
+                    else:
+                        self._job_submission_executor.submit(self.run_job, job)
 
     # ------------------------------------------------------------------
     # Single-job submission
