@@ -794,6 +794,11 @@ class Executor(RemoteExecutor):
             # The script reads SGE_TASK_ID, extracts the matching command
             # from the task map, decompresses it, and executes it.
             kind = "group" if jobs[0].is_group() else "rule"
+            # The TASK_MAP and _tid variables must be `export`-ed so the
+            # python3 child process invoked below can read them via
+            # os.environ — plain shell variables are not inherited by
+            # subprocesses.  (Pre-0.5.0 these came in via qsub -V, which
+            # is no longer the default.)
             script_lines = [
                 "#!/bin/bash",
                 "set -euo pipefail",
@@ -801,10 +806,10 @@ class Executor(RemoteExecutor):
                 f"# run_uuid={self.run_uuid}",
                 "",
                 "# Task map: base64(JSON({task_id: base64(zlib(cmd))}))",
-                f"TASK_MAP={shlex.quote(task_map_b64)}",
+                f"export TASK_MAP={shlex.quote(task_map_b64)}",
                 "",
                 "# Extract and run the command for this task",
-                "_tid=${SGE_TASK_ID}",
+                "export _tid=${SGE_TASK_ID}",
                 "_cmd=$(",
                 "  python3 - <<'PYEOF'",
                 "import sys, base64, zlib, json, os",
@@ -868,7 +873,6 @@ class Executor(RemoteExecutor):
                     shell=True,
                     text=True,
                     stderr=subprocess.STDOUT,
-                    env={**os.environ, "TASK_MAP": task_map_b64},
                 ).strip()
             except subprocess.CalledProcessError as e:
                 error_msg = (
