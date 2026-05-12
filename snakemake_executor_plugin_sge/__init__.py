@@ -385,11 +385,16 @@ class Executor(RemoteExecutor):
         self._job_to_sge: "dict[JobExecutorInterface, tuple]" = {}
 
         # Buffer for accumulating regular jobs per rule across multiple
-        # run_jobs() calls.  Under --immediate-submit Snakemake releases
-        # jobs in waves as DAG levels unlock; without buffering, each wave
-        # produces a separate array job for the same rule.  Jobs are held
-        # here until _flush_pending_buckets() submits them all at once.
+        # run_jobs() calls.  Under --immediate-submit Snakemake batches up to
+        # N jobs per run_jobs() call, so a rule's 150 jobs may arrive across
+        # several calls.  We accumulate here and flush after a short quiet
+        # period (no new run_jobs call for _FLUSH_DELAY seconds).
         self._pending_buckets: "dict[str, List[JobExecutorInterface]]" = {}
+        # Handle for the pending asyncio deferred flush; cancelled and
+        # rescheduled on every run_jobs() call.
+        self._flush_handle: Optional[asyncio.TimerHandle] = None
+        # Seconds to wait after the last run_jobs() call before flushing.
+        self._FLUSH_DELAY: float = 2.0
 
         atexit.register(self.clean_old_logs)
 
@@ -426,6 +431,23 @@ class Executor(RemoteExecutor):
     # Job dispatch
     # ------------------------------------------------------------------
 
+    def _flush_pending_buckets(self) -> None:
+        """Submit all accumulated regular-job buckets as array jobs.
+
+        Called after a short quiet period following the last run_jobs() call,
+        so that jobs for the same rule that arrive across multiple run_jobs()
+        batches are coalesced into a single SGE array.
+        """
+        self._flush_handle = None
+        immediate = self.workflow.remote_execution_settings.immediate_submit
+        for rule_name, bucket in list(self._pending_buckets.items()):
+            bucket.sort(key=_wildcard_sort_key)
+            if immediate:
+                self.run_array_job(bucket)
+            else:
+                self._job_submission_executor.submit(self.run_array_job, bucket)
+            del self._pending_buckets[rule_name]
+
     def run_jobs(self, jobs: List[JobExecutorInterface]) -> None:
         """Classify and dispatch incoming jobs.
 
@@ -433,13 +455,12 @@ class Executor(RemoteExecutor):
         --------
         Regular (non-group) jobs from the same rule are accumulated in
         ``_pending_buckets`` across successive run_jobs() calls.  Under
-        ``--immediate-submit`` Snakemake releases jobs in waves as DAG
-        levels unlock; without buffering each wave would produce a separate
-        array job for the same rule.  After accumulating, all pending
-        regular-job buckets are sorted by wildcards and submitted as one
+        ``--immediate-submit`` Snakemake batches up to N jobs per call, so
+        a rule's jobs may arrive across several calls.  A deferred flush
+        (_FLUSH_DELAY seconds after the last call) coalesces them into one
         array job per rule.
 
-        Group jobs follow the existing logic: bundled into a single array
+        Group jobs are submitted immediately: bundled into a single array
         when ``group_jobs_as_array`` is enabled, individually otherwise.
         """
         if self._main_event_loop is None:
@@ -457,22 +478,24 @@ class Executor(RemoteExecutor):
             else:
                 self._pending_buckets.setdefault(job.name, []).append(job)
 
-        # Flush all accumulated regular-job buckets: sort each bucket by
-        # wildcards for deterministic task indices (prerequisite for
-        # -hold_jid_ad), then submit as one array job per rule.
-        for rule_name, bucket in list(self._pending_buckets.items()):
-            bucket.sort(key=_wildcard_sort_key)
-            if immediate:
-                self.run_array_job(bucket)
-            else:
-                self._job_submission_executor.submit(self.run_array_job, bucket)
-            del self._pending_buckets[rule_name]
+        # (Re)schedule the deferred flush.  Cancelling and rescheduling on
+        # every call means the flush fires _FLUSH_DELAY seconds after the
+        # *last* run_jobs() call, not the first.
+        if self._main_event_loop is not None:
+            if self._flush_handle is not None:
+                self._flush_handle.cancel()
+            self._flush_handle = self._main_event_loop.call_later(
+                self._FLUSH_DELAY, self._flush_pending_buckets
+            )
+        else:
+            # No event loop (non-immediate-submit path): flush right away.
+            self._flush_pending_buckets()
 
-        # Submit group jobs
+        # Submit group jobs immediately — they don't need coalescing because
+        # each group job is a distinct logical unit with its own resources.
         if group_jobs:
             settings = self.workflow.executor_settings
             if settings.group_jobs_as_array and len(group_jobs) > 1:
-                # Package all group tasks as a single array job
                 if immediate:
                     self.run_array_job(group_jobs)
                 else:
@@ -480,7 +503,6 @@ class Executor(RemoteExecutor):
                         self.run_array_job, group_jobs
                     )
             else:
-                # Fallback: submit each group job task individually
                 for job in group_jobs:
                     if immediate:
                         self.run_job(job)
