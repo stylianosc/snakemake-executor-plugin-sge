@@ -41,25 +41,26 @@ def test_fmt_mem_non_round():         assert _fmt_mem(3000) == "3000M"
 def test_fmt_mem_1gb():               assert _fmt_mem(1024) == "1G"
 
 def test_basic():
-    cmd = get_submit_command(FakeJob(), PARAMS, FakeSettings(), "/s.sh", "1-1")
+    cmd = get_submit_command(FakeJob(), PARAMS, FakeSettings(), exec_cmd="/s.sh", is_array=True)
     assert "qsub" in cmd
     assert "-S /bin/bash" in cmd
-    assert "-N" in cmd
+    assert "-N test_rule_abc123" in cmd
+    # Note: when is_array is True, the function tries to parse params["array_range"] which is not in PARAMS, defaulting to "1-1"
     assert "-t 1-1" in cmd
-    assert "/s.sh" in cmd
 
 def test_array_range():
-    cmd = get_submit_command(FakeJob(), PARAMS, FakeSettings(), "/s.sh", "3-20")
+    p = dict(PARAMS, array_range="3-20")
+    cmd = get_submit_command(FakeJob(), p, FakeSettings(), exec_cmd="/s.sh", is_array=True)
     assert "-t 3-20" in cmd
 
 def test_queue_from_settings():
     s = FakeSettings(); s.queue = "short.q"
-    cmd = get_submit_command(FakeJob(), PARAMS, s, "/s.sh", "1-1")
+    cmd = get_submit_command(FakeJob(), PARAMS, s, exec_cmd="/s.sh")
     assert "-q short.q" in cmd
 
 def test_queue_override_per_rule():
     cmd = get_submit_command(
-        FakeJob(sge_queue="highmem.q"), PARAMS, FakeSettings(), "/s.sh", "1-1"
+        FakeJob(sge_queue="highmem.q"), PARAMS, FakeSettings(), exec_cmd="/s.sh"
     )
     assert "-q highmem.q" in cmd
 

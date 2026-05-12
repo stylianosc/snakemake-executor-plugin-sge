@@ -126,8 +126,17 @@ def get_submit_command(
     workdir   = params.get("workdir", "")
 
     # ── job name (max 64 chars, must start with letter) ────────────────────
-    # 'sm_' prefix ensures we never start with a digit.
-    job_name = f"sm_{run_uuid}"[:64]
+    # Use rule name from resources (or job.name). If generic or missing, add a clear prefix with run UUID.
+    job_rule = job.resources.get("name") if hasattr(job, "resources") and job.resources else None
+    if not job_rule:
+        job_rule = getattr(job, "name", "job")
+        
+    if getattr(job, "is_group", lambda: False)():
+        job_name = f"sm_grp_{job_rule}_{run_uuid[:8]}"[:64]
+    elif not job_rule or job_rule == "job":
+        job_name = f"sm_job_{run_uuid[:8]}"[:64]
+    else:
+        job_name = f"{job_rule}_{run_uuid[:8]}"[:64]
 
     # ── merge logs? ─────────────────────────────────────────────────
     join_logs = bool(
