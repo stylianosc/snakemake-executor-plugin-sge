@@ -384,17 +384,16 @@ class Executor(RemoteExecutor):
         # need it).
         self._job_to_sge: "dict[JobExecutorInterface, tuple]" = {}
 
-        # Buffer for accumulating regular jobs per rule across multiple
-        # run_jobs() calls.  Under --immediate-submit Snakemake batches up to
-        # N jobs per run_jobs() call, so a rule's 150 jobs may arrive across
-        # several calls.  We accumulate here and flush after a short quiet
-        # period (no new run_jobs call for _FLUSH_DELAY seconds).
-        self._pending_buckets: "dict[str, List[JobExecutorInterface]]" = {}
-        # Handle for the pending asyncio deferred flush; cancelled and
-        # rescheduled on every run_jobs() call.
-        self._flush_handle: Optional[asyncio.TimerHandle] = None
-        # Seconds to wait after the last run_jobs() call before flushing.
-        self._FLUSH_DELAY: float = 2.0
+        # Per-rule task index offset: tracks how many tasks have been submitted
+        # for each rule so far.  When Snakemake batches run_jobs() calls for
+        # the same rule, each batch's SGE_TASK_IDs continue from where the
+        # previous batch left off, keeping them consistent with the task map.
+        self._rule_task_offset: "dict[str, int]" = {}
+        # Per-rule accumulated task map (task_id → b64-zlib-cmd).  Grown
+        # across batches so all arrays for a rule share one task_map.b64 file
+        # and any task can resolve its command regardless of which array it
+        # landed in.
+        self._rule_task_map: "dict[str, dict]" = {}
 
         atexit.register(self.clean_old_logs)
 
@@ -431,37 +430,16 @@ class Executor(RemoteExecutor):
     # Job dispatch
     # ------------------------------------------------------------------
 
-    def _flush_pending_buckets(self) -> None:
-        """Submit all accumulated regular-job buckets as array jobs.
-
-        Called after a short quiet period following the last run_jobs() call,
-        so that jobs for the same rule that arrive across multiple run_jobs()
-        batches are coalesced into a single SGE array.
-        """
-        self._flush_handle = None
-        immediate = self.workflow.remote_execution_settings.immediate_submit
-        for rule_name, bucket in list(self._pending_buckets.items()):
-            bucket.sort(key=_wildcard_sort_key)
-            if immediate:
-                self.run_array_job(bucket)
-            else:
-                self._job_submission_executor.submit(self.run_array_job, bucket)
-            del self._pending_buckets[rule_name]
-
     def run_jobs(self, jobs: List[JobExecutorInterface]) -> None:
         """Classify and dispatch incoming jobs.
 
-        Strategy
-        --------
-        Regular (non-group) jobs from the same rule are accumulated in
-        ``_pending_buckets`` across successive run_jobs() calls.  Under
-        ``--immediate-submit`` Snakemake batches up to N jobs per call, so
-        a rule's jobs may arrive across several calls.  A deferred flush
-        (_FLUSH_DELAY seconds after the last call) coalesces them into one
-        array job per rule.
-
-        Group jobs are submitted immediately: bundled into a single array
-        when ``group_jobs_as_array`` is enabled, individually otherwise.
+        Regular (non-group) jobs are bucketed by rule name and submitted as
+        SGE array jobs.  When Snakemake calls run_jobs() multiple times for
+        the same rule (batching behaviour under --immediate-submit), each
+        call produces a separate array submission.  Task IDs are globally
+        consecutive across calls (tracked via _rule_task_offset) so that
+        SGE_TASK_ID always maps to the correct entry in the shared task map
+        file, and -hold_jid_ad indices remain consistent.
         """
         if self._main_event_loop is None:
             try:
@@ -472,27 +450,22 @@ class Executor(RemoteExecutor):
         immediate = self.workflow.remote_execution_settings.immediate_submit
 
         group_jobs: List[JobExecutorInterface] = []
+        regular_buckets: "dict[str, List[JobExecutorInterface]]" = {}
         for job in jobs:
             if job.is_group():
                 group_jobs.append(job)
             else:
-                self._pending_buckets.setdefault(job.name, []).append(job)
+                regular_buckets.setdefault(job.name, []).append(job)
 
-        # (Re)schedule the deferred flush.  Cancelling and rescheduling on
-        # every call means the flush fires _FLUSH_DELAY seconds after the
-        # *last* run_jobs() call, not the first.
-        if self._main_event_loop is not None:
-            if self._flush_handle is not None:
-                self._flush_handle.cancel()
-            self._flush_handle = self._main_event_loop.call_later(
-                self._FLUSH_DELAY, self._flush_pending_buckets
-            )
-        else:
-            # No event loop (non-immediate-submit path): flush right away.
-            self._flush_pending_buckets()
+        for bucket in regular_buckets.values():
+            bucket.sort(key=_wildcard_sort_key)
 
-        # Submit group jobs immediately — they don't need coalescing because
-        # each group job is a distinct logical unit with its own resources.
+        for bucket in regular_buckets.values():
+            if immediate:
+                self.run_array_job(bucket)
+            else:
+                self._job_submission_executor.submit(self.run_array_job, bucket)
+
         if group_jobs:
             settings = self.workflow.executor_settings
             if settings.group_jobs_as_array and len(group_jobs) > 1:
@@ -765,35 +738,49 @@ class Executor(RemoteExecutor):
         logdir = self.sge_logdir / group_or_rule
         logdir.mkdir(parents=True, exist_ok=True)
 
-        # Build the compressed task → command map
-        # task IDs in SGE arrays start at 1
+        # Determine the global starting task index for this batch.
+        # Successive run_jobs() calls for the same rule each produce a
+        # separate run_array_job() invocation.  Without a global offset the
+        # second batch would number its tasks 1..50 again, but SGE assigns
+        # them 51..100, causing KeyError when the script looks up "51" in a
+        # map that only contains "1".."50".
+        rule_key = group_or_rule
+        global_start = self._rule_task_offset.get(rule_key, 0) + 1
+        n_tasks = len(jobs)
+        self._rule_task_offset[rule_key] = global_start + n_tasks - 1
+
+        # Build the compressed task → command map using globally consecutive
+        # task IDs so SGE_TASK_ID always matches the map key.
         task_map = {
             str(idx): base64.b64encode(
                 zlib.compress(self.format_job_exec(job).encode("utf-8"), level=9)
             ).decode()
-            for idx, job in enumerate(jobs, start=1)
+            for idx, job in enumerate(jobs, start=global_start)
         }
 
-        # Serialise the map to a file on the shared filesystem.  The script
-        # reads it at runtime via the TASK_MAP_FILE env var.  Embedding the
-        # map directly in the script (or as a shell variable) hits the
-        # kernel ARG_MAX limit for large arrays (150+ tasks with long cmds).
-        task_map_json = json.dumps(task_map)
-        task_map_b64 = base64.b64encode(task_map_json.encode()).decode()
+        # Accumulate into the per-rule task map and (re)write the shared file
+        # so all arrays for this rule can read the complete map.
+        if rule_key not in self._rule_task_map:
+            self._rule_task_map[rule_key] = {}
+        self._rule_task_map[rule_key].update(task_map)
+        task_map_b64 = base64.b64encode(
+            json.dumps(self._rule_task_map[rule_key]).encode()
+        ).decode()
 
-        # Manifest: human-readable record of which task ID maps to which
-        # wildcards.  Aids debugging when scanning SGE log files.
+        # Manifest: human-readable record of task ID → wildcards for debugging.
         manifest = {
             str(idx): {
                 "snakemake_jobid": getattr(job, "jobid", None),
                 "wildcards": dict(job.wildcards) if getattr(job, "wildcards", None) else {},
                 "is_group": job.is_group(),
             }
-            for idx, job in enumerate(jobs, start=1)
+            for idx, job in enumerate(jobs, start=global_start)
         }
         manifest_path = logdir / "task_manifest.json"
         try:
-            manifest_path.write_text(json.dumps(manifest, indent=2))
+            existing = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+            existing.update(manifest)
+            manifest_path.write_text(json.dumps(existing, indent=2))
         except OSError as exc:
             self.logger.debug(f"Could not write task manifest {manifest_path}: {exc}")
 
@@ -805,17 +792,20 @@ class Executor(RemoteExecutor):
 
         settings = self.workflow.executor_settings
         array_limit = settings.array_limit
-        n_tasks = len(jobs)
 
-        # Write the task map to a file on the shared filesystem so the
-        # submission script can read it at runtime.  Embedding it directly
-        # in the script or as a shell variable hits ARG_MAX for large arrays.
+        # Write the complete (cumulative) task map for this rule so all
+        # submitted arrays can resolve any task ID.  Named per rule so
+        # concurrent rules don't overwrite each other's file.
         task_map_file = logdir / "task_map.b64"
         task_map_file.write_text(task_map_b64)
 
-        for chunk_start in range(1, n_tasks + 1, array_limit):
-            chunk_end = min(chunk_start + array_limit - 1, n_tasks)
-            chunk_jobs = jobs[chunk_start - 1 : chunk_end]
+        global_end = global_start + n_tasks - 1
+        for chunk_start in range(global_start, global_end + 1, array_limit):
+            chunk_end = min(chunk_start + array_limit - 1, global_end)
+            # Convert global task indices back to local slice indices (0-based)
+            local_start = chunk_start - global_start
+            local_end = chunk_end - global_start + 1
+            chunk_jobs = jobs[local_start:local_end]
 
             kind = "group" if jobs[0].is_group() else "rule"
             script_lines = [
