@@ -384,6 +384,13 @@ class Executor(RemoteExecutor):
         # need it).
         self._job_to_sge: "dict[JobExecutorInterface, tuple]" = {}
 
+        # Buffer for accumulating regular jobs per rule across multiple
+        # run_jobs() calls.  Under --immediate-submit Snakemake releases
+        # jobs in waves as DAG levels unlock; without buffering, each wave
+        # produces a separate array job for the same rule.  Jobs are held
+        # here until _flush_pending_buckets() submits them all at once.
+        self._pending_buckets: "dict[str, List[JobExecutorInterface]]" = {}
+
         atexit.register(self.clean_old_logs)
 
         # Warn if neither qstat nor qacct is available
@@ -424,11 +431,13 @@ class Executor(RemoteExecutor):
 
         Strategy
         --------
-        Regular (non-group) jobs from the same rule arriving in one batch are
-        bucketed and submitted as a single SGE array job (qsub -t).  This
-        dramatically reduces scheduler overhead when many instances of the
-        same rule are submitted at once (e.g. one task per subject under
-        --immediate-submit).  Single-instance rules become a 1-task array.
+        Regular (non-group) jobs from the same rule are accumulated in
+        ``_pending_buckets`` across successive run_jobs() calls.  Under
+        ``--immediate-submit`` Snakemake releases jobs in waves as DAG
+        levels unlock; without buffering each wave would produce a separate
+        array job for the same rule.  After accumulating, all pending
+        regular-job buckets are sorted by wildcards and submitted as one
+        array job per rule.
 
         Group jobs follow the existing logic: bundled into a single array
         when ``group_jobs_as_array`` is enabled, individually otherwise.
@@ -439,38 +448,25 @@ class Executor(RemoteExecutor):
             except RuntimeError:
                 self._main_event_loop = None
 
-        # Separate group jobs from regular jobs.  Regular jobs are bucketed
-        # by rule name and sorted by wildcards within each bucket so that
-        # task indices are deterministic AND consistent across rules that
-        # share the same wildcards (e.g. {subject}).  This is what enables
-        # -hold_jid_ad: when downstream task N is held on upstream task N,
-        # the two tasks must refer to the same logical unit.
+        immediate = self.workflow.remote_execution_settings.immediate_submit
+
         group_jobs: List[JobExecutorInterface] = []
-        # Use a dict to bucket regular jobs by rule name. Python preserves
-        # insertion order, so the first-seen rule is submitted first.
-        regular_buckets: "dict[str, List[JobExecutorInterface]]" = {}
         for job in jobs:
             if job.is_group():
                 group_jobs.append(job)
             else:
-                regular_buckets.setdefault(job.name, []).append(job)
-        for bucket in regular_buckets.values():
+                self._pending_buckets.setdefault(job.name, []).append(job)
+
+        # Flush all accumulated regular-job buckets: sort each bucket by
+        # wildcards for deterministic task indices (prerequisite for
+        # -hold_jid_ad), then submit as one array job per rule.
+        for rule_name, bucket in list(self._pending_buckets.items()):
             bucket.sort(key=_wildcard_sort_key)
-
-        # With --immediate-submit, each report_job_submission call releases
-        # the scheduler semaphore.  If we dispatch to threads, the scheduler
-        # can race ahead before all jobs in this batch are registered,
-        # concluding the workflow is stuck.  Submit synchronously instead.
-        immediate = self.workflow.remote_execution_settings.immediate_submit
-
-        # Submit each per-rule bucket as one array job.
-        for rule_name, bucket in regular_buckets.items():
             if immediate:
                 self.run_array_job(bucket)
             else:
-                self._job_submission_executor.submit(
-                    self.run_array_job, bucket
-                )
+                self._job_submission_executor.submit(self.run_array_job, bucket)
+            del self._pending_buckets[rule_name]
 
         # Submit group jobs
         if group_jobs:
@@ -566,7 +562,7 @@ class Executor(RemoteExecutor):
         all_base_ids: List[str] = []
         for j in chunk_jobs:
             entries: List[tuple] = []
-            for _up, sge_jobid, task_idx in self._upstream_ext_ids(j):
+            for _, sge_jobid, task_idx in self._upstream_ext_ids(j):
                 entries.append((sge_jobid, task_idx))
                 if sge_jobid not in all_base_ids:
                     all_base_ids.append(sge_jobid)
@@ -756,7 +752,10 @@ class Executor(RemoteExecutor):
             for idx, job in enumerate(jobs, start=1)
         }
 
-        # Serialise the map; it will be embedded in the shell script
+        # Serialise the map to a file on the shared filesystem.  The script
+        # reads it at runtime via the TASK_MAP_FILE env var.  Embedding the
+        # map directly in the script (or as a shell variable) hits the
+        # kernel ARG_MAX limit for large arrays (150+ tasks with long cmds).
         task_map_json = json.dumps(task_map)
         task_map_b64 = base64.b64encode(task_map_json.encode()).decode()
 
@@ -786,34 +785,33 @@ class Executor(RemoteExecutor):
         array_limit = settings.array_limit
         n_tasks = len(jobs)
 
+        # Write the task map to a file on the shared filesystem so the
+        # submission script can read it at runtime.  Embedding it directly
+        # in the script or as a shell variable hits ARG_MAX for large arrays.
+        task_map_file = logdir / "task_map.b64"
+        task_map_file.write_text(task_map_b64)
+
         for chunk_start in range(1, n_tasks + 1, array_limit):
             chunk_end = min(chunk_start + array_limit - 1, n_tasks)
             chunk_jobs = jobs[chunk_start - 1 : chunk_end]
 
-            # Build the submission script
-            # The script reads SGE_TASK_ID, extracts the matching command
-            # from the task map, decompresses it, and executes it.
             kind = "group" if jobs[0].is_group() else "rule"
-            # The TASK_MAP and _tid variables must be `export`-ed so the
-            # python3 child process invoked below can read them via
-            # os.environ — plain shell variables are not inherited by
-            # subprocesses.  (Pre-0.5.0 these came in via qsub -V, which
-            # is no longer the default.)
             script_lines = [
                 "#!/bin/bash",
                 "set -euo pipefail",
                 f"# SGE array job for Snakemake {kind} '{jobs[0].name}'",
                 f"# run_uuid={self.run_uuid}",
                 "",
-                "# Task map: base64(JSON({task_id: base64(zlib(cmd))}))",
-                f"export TASK_MAP={shlex.quote(task_map_b64)}",
+                "# Read the task map from the shared filesystem file.",
+                "# Avoids ARG_MAX issues for large arrays (150+ tasks).",
+                f"export TASK_MAP_FILE={shlex.quote(str(task_map_file))}",
                 "",
                 "# Extract and run the command for this task",
                 "export _tid=${SGE_TASK_ID}",
                 "_cmd=$(",
                 "  python3 - <<'PYEOF'",
                 "import sys, base64, zlib, json, os",
-                "task_map = json.loads(base64.b64decode(os.environ['TASK_MAP']))",
+                "task_map = json.loads(base64.b64decode(open(os.environ['TASK_MAP_FILE']).read()))",
                 "tid = str(os.environ['_tid'])",
                 "cmd = zlib.decompress(base64.b64decode(task_map[tid])).decode()",
                 "sys.stdout.write(cmd)",
@@ -824,19 +822,16 @@ class Executor(RemoteExecutor):
 
             script_content = "\n".join(script_lines)
 
-            # Write the script to a temp file so we can pass it to qsub
             script_path = logdir / f"array_job_{chunk_start}_{chunk_end}.sh"
             script_path.write_text(script_content)
             script_path.chmod(0o755)
 
-            # Build qsub flags for the array
             job_params = {
                 "run_uuid": self.run_uuid,
                 "log_stdout": logdir / "$JOB_ID.$TASK_ID.o",
                 "log_stderr": logdir / "$JOB_ID.$TASK_ID.e",
                 "workdir": self.workflow.workdir_init,
                 "array_range": f"{chunk_start}-{chunk_end}",
-                "task_map_b64": task_map_b64,
             }
 
             # Resolve cross-array dependencies.  Two cases:
@@ -957,7 +952,7 @@ class Executor(RemoteExecutor):
         max_sleep = 180
         initial_interval = settings.init_seconds_before_status_checks
 
-        for attempt in range(settings.status_attempts):
+        for _ in range(settings.status_attempts):
             async with self.status_rate_limiter:
                 status_map = await query_job_status(
                     active_jobs,
