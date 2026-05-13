@@ -266,6 +266,20 @@ def test_workdir(tmp_path):
     cmd = get_submit_command(FakeJob(), params, FakeSettings(), "/s.sh", "1-1")
     assert f"-wd {workdir}" in cmd
 
+def test_resource_workdir_overrides_param_workdir(tmp_path):
+    param_workdir = tmp_path / "param_work"
+    resource_workdir = tmp_path / "resource_work"
+    params = dict(PARAMS, workdir=str(param_workdir))
+    cmd = get_submit_command(
+        FakeJob(workdir=str(resource_workdir)),
+        params,
+        FakeSettings(),
+        "/s.sh",
+        "1-1",
+    )
+    assert f"-wd {resource_workdir}" in cmd
+    assert f"-wd {param_workdir}" not in cmd
+
 def test_no_workdir_uses_cwd():
     p = dict(PARAMS, workdir="")
     cmd = get_submit_command(FakeJob(), p, FakeSettings(), "/s.sh", "1-1")

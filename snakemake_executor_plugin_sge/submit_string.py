@@ -260,7 +260,7 @@ def get_submit_command(
     """
     log_dir   = Path(params.get("log_dir") or str(params.get("log_stdout", "")).rsplit("/", 1)[0])
     run_uuid  = params.get("run_uuid", "0000")
-    workdir   = params.get("workdir", "")
+    workdir   = job.resources.get("workdir") or params.get("workdir", "")
     sge_extra_raw = job.resources.get("sge_extra") or getattr(settings, "extra", None)
     sge_extra = _normalize_sge_extra(sge_extra_raw)
 
