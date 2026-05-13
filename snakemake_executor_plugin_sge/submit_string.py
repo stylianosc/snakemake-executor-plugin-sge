@@ -275,12 +275,16 @@ def get_submit_command(
     if not job_rule:
         job_rule = getattr(job, "name", "job")
         
+    import re
+    # SGE job names cannot contain slashes or start with numbers.
+    # Replace anything not alphanumeric, hyphen, or underscore with underscore.
+    safe_rule = re.sub(r"[^\w-]", "_", job_rule)
     if getattr(job, "is_group", lambda: False)():
-        job_name = f"sm_grp_{job_rule}_{run_uuid[:8]}"[:64]
+        job_name = f"sm_grp_{safe_rule}_{run_uuid[:8]}"[:64]
     elif not job_rule or job_rule == "job":
         job_name = f"sm_job_{run_uuid[:8]}"[:64]
     else:
-        job_name = f"{job_rule}_{run_uuid[:8]}"[:64]
+        job_name = f"{safe_rule}_{run_uuid[:8]}"[:64]
 
     # ── merge logs? ─────────────────────────────────────────────────
     join_logs = bool(
