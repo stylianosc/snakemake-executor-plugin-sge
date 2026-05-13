@@ -93,6 +93,62 @@ def test_workdir_is_created(monkeypatch, tmp_path):
     assert "qsub" in cmd
     assert {"path": str(tmp_path / "work"), "parents": True, "exist_ok": True} in created
 
+def test_sge_extra_wd_dir_is_created(monkeypatch, tmp_path):
+    created = []
+
+    def fake_mkdir(self, parents=False, exist_ok=False):
+        created.append({
+            "path": str(self),
+            "parents": parents,
+            "exist_ok": exist_ok,
+        })
+
+    monkeypatch.setattr("pathlib.Path.mkdir", fake_mkdir)
+
+    extra_wd = str(tmp_path / "sge_logs")
+    cmd = get_submit_command(
+        FakeJob(sge_extra=f"-wd {extra_wd}"),
+        PARAMS,
+        FakeSettings(),
+        exec_cmd="/s.sh",
+        is_array=True,
+    )
+
+    assert "qsub" in cmd
+    assert f"-wd {extra_wd}" in cmd
+    assert {"path": extra_wd, "parents": True, "exist_ok": True} in created
+
+def test_sge_extra_aliases_normalized_and_dirs_created(monkeypatch, tmp_path):
+    created = []
+
+    def fake_mkdir(self, parents=False, exist_ok=False):
+        created.append({
+            "path": str(self),
+            "parents": parents,
+            "exist_ok": exist_ok,
+        })
+
+    monkeypatch.setattr("pathlib.Path.mkdir", fake_mkdir)
+
+    wd = str(tmp_path / "wd")
+    out = str(tmp_path / "logs" / "out.log")
+    err = str(tmp_path / "logs" / "err.log")
+    cmd = get_submit_command(
+        FakeJob(sge_extra=f"workdir={wd} output={out} error={err} runtime=01:00:00"),
+        PARAMS,
+        FakeSettings(),
+        exec_cmd="/s.sh",
+        is_array=True,
+    )
+
+    assert "qsub" in cmd
+    assert f"-wd {wd}" in cmd
+    assert f"-o {out}" in cmd
+    assert f"-e {err}" in cmd
+    assert "-l h_rt=01:00:00" in cmd
+    assert {"path": wd, "parents": True, "exist_ok": True} in created
+    assert {"path": str(tmp_path / "logs"), "parents": True, "exist_ok": True} in created
+
 def test_array_range():
     p = dict(PARAMS, array_range="3-20")
     cmd = get_submit_command(FakeJob(), p, FakeSettings(), exec_cmd="/s.sh", is_array=True)

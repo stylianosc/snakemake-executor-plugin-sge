@@ -84,6 +84,143 @@ def _safe(value) -> str:
     return shlex.quote(str(value))
 
 
+_OPTION_ALIASES = {
+    "binding": "binding",
+    "cwd": "cwd",
+    "error": "e",
+    "e": "e",
+    "hard": "hard",
+    "join": "j",
+    "j": "j",
+    "mail_options": "m",
+    "m": "m",
+    "email": "M",
+    "M": "M",
+    "notify": "notify",
+    "now": "now",
+    "name": "N",
+    "N": "N",
+    "output": "o",
+    "o": "o",
+    "project": "P",
+    "P": "P",
+    "priority": "p",
+    "p": "p",
+    "parallel_environment": "pe",
+    "pe": "pe",
+    "pty": "pty",
+    "queue": "q",
+    "q": "q",
+    "reservation": "R",
+    "R": "R",
+    "rerun": "r",
+    "r": "r",
+    "shell": "S",
+    "S": "S",
+    "soft": "soft",
+    "variable": "v",
+    "v": "v",
+    "export_env": "V",
+    "V": "V",
+    "workdir": "wd",
+    "wd": "wd",
+}
+
+_RESOURCE_ALIASES = {
+    "runtime": "h_rt",
+    "time": "h_rt",
+    "walltime": "h_rt",
+    "cpu": "h_cpu",
+    "mem_mb": "h_vmem",
+    "mem": "h_vmem",
+    "memory": "h_vmem",
+    "virtual_memory": "h_vmem",
+    "scratch_size": "tscratch",
+    "disk_mb": "h_fsize",
+}
+
+
+def _ensure_option_path(option: str, value: str) -> None:
+    """Create directories for path-based qsub options where relevant."""
+    if not value or "$" in value:
+        return
+
+    path = Path(value)
+    if option == "wd":
+        path.mkdir(parents=True, exist_ok=True)
+    elif option in {"o", "e"}:
+        # SGE accepts either file path or directory (often with trailing slash).
+        if value.endswith("/"):
+            path.mkdir(parents=True, exist_ok=True)
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _normalize_sge_extra(sge_extra: Optional[str]) -> Optional[str]:
+    """Normalize key/value aliases in sge_extra to canonical qsub flags.
+
+    Examples:
+      - output=/path/log -> -o /path/log
+      - workdir=/path/wd -> -wd /path/wd
+      - runtime=20:00:00 -> -l h_rt=20:00:00
+    """
+    if not sge_extra:
+        return sge_extra
+
+    try:
+        tokens = shlex.split(str(sge_extra))
+    except ValueError:
+        return sge_extra
+
+    normalized: list[str] = []
+    idx = 0
+    while idx < len(tokens):
+        token = tokens[idx]
+
+        # Preserve canonical qsub flags as-is.
+        if token.startswith("-"):
+            normalized.append(token)
+            # Create dirs for explicit path flags where value is next token.
+            if token in {"-wd", "-o", "-e"} and idx + 1 < len(tokens):
+                _ensure_option_path(token[1:], tokens[idx + 1])
+            elif token.startswith("-wd") and token != "-wd":
+                _ensure_option_path("wd", token[3:])
+            elif token.startswith("-o") and token != "-o":
+                _ensure_option_path("o", token[2:])
+            elif token.startswith("-e") and token != "-e":
+                _ensure_option_path("e", token[2:])
+            idx += 1
+            continue
+
+        # Convert alias=value syntax.
+        if "=" in token:
+            key, value = token.split("=", 1)
+            canon_opt = _OPTION_ALIASES.get(key)
+            if canon_opt:
+                normalized.extend([f"-{canon_opt}", value])
+                _ensure_option_path(canon_opt, value)
+                idx += 1
+                continue
+
+            canon_res = _RESOURCE_ALIASES.get(key)
+            if canon_res:
+                normalized.extend(["-l", f"{canon_res}={value}"])
+                idx += 1
+                continue
+
+        # Convert bare alias options (e.g. "cwd").
+        canon_opt = _OPTION_ALIASES.get(token)
+        if canon_opt and canon_opt in {"cwd", "hard", "notify", "now", "soft", "V"}:
+            normalized.append(f"-{canon_opt}")
+            idx += 1
+            continue
+
+        normalized.append(token)
+        idx += 1
+
+    return " ".join(_safe(t) if " " in t else t for t in normalized)
+
+
 def get_submit_command(
     job,
     params: dict,
@@ -124,6 +261,8 @@ def get_submit_command(
     log_dir   = Path(params.get("log_dir") or str(params.get("log_stdout", "")).rsplit("/", 1)[0])
     run_uuid  = params.get("run_uuid", "0000")
     workdir   = params.get("workdir", "")
+    sge_extra_raw = job.resources.get("sge_extra") or getattr(settings, "extra", None)
+    sge_extra = _normalize_sge_extra(sge_extra_raw)
 
     # SGE expects the stdout/stderr log directory to exist already.
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -349,7 +488,6 @@ def get_submit_command(
         call += f" -t {array_range}"
 
     # ── extra qsub flags (per-rule or global) ──────────────────────────
-    sge_extra = job.resources.get("sge_extra") or getattr(settings, "extra", None)
     if sge_extra:
         call += f" {sge_extra}"
 
