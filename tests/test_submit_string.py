@@ -2,6 +2,8 @@
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from typing import Any
+
 from snakemake_executor_plugin_sge.submit_string import (
     get_submit_command,
     _fmt_runtime,
@@ -22,13 +24,24 @@ class FakeJob:
     def is_group(self): return False
 
 class FakeSettings:
-    queue = None; pe = None; project = None; priority = None
-    export_env = True; extra_envvars = None; requeue = None
-    reservation = None; notify = False; mail_on = None
-    mail_address = None; hold_jid = None; task_concurrency = None
-    extra = None; join_logs = False
+    def __init__(self):
+        self.queue: Any = None
+        self.pe: Any = None
+        self.project: Any = None
+        self.priority: Any = None
+        self.export_env = True
+        self.extra_envvars: Any = None
+        self.requeue: Any = None
+        self.reservation: Any = None
+        self.notify = False
+        self.mail_on: Any = None
+        self.mail_address: Any = None
+        self.hold_jid: Any = None
+        self.task_concurrency: Any = None
+        self.extra: Any = None
+        self.join_logs = False
 
-PARAMS = dict(run_uuid="abc123", log_dir="/logs", workdir="/work")
+PARAMS = dict(run_uuid="abc123", log_dir="logs", workdir="/work")
 
 def test_fmt_runtime_whole_hours():   assert _fmt_runtime(120) == "02:00:00"
 def test_fmt_runtime_mixed():         assert _fmt_runtime(75)  == "01:15:00"
@@ -47,6 +60,21 @@ def test_basic():
     assert "-N test_rule_abc123" in cmd
     # Note: when is_array is True, the function tries to parse params["array_range"] which is not in PARAMS, defaulting to "1-1"
     assert "-t 1-1" in cmd
+
+def test_log_dir_is_created(monkeypatch, tmp_path):
+    created = {}
+
+    def fake_mkdir(self, parents=False, exist_ok=False):
+        created["path"] = str(self)
+        created["parents"] = parents
+        created["exist_ok"] = exist_ok
+
+    monkeypatch.setattr("pathlib.Path.mkdir", fake_mkdir)
+
+    params = dict(PARAMS, log_dir=str(tmp_path / "logs"))
+    cmd = get_submit_command(FakeJob(), params, FakeSettings(), exec_cmd="/s.sh", is_array=True)
+    assert "qsub" in cmd
+    assert created == {"path": str(tmp_path / "logs"), "parents": True, "exist_ok": True}
 
 def test_array_range():
     p = dict(PARAMS, array_range="3-20")

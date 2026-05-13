@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Optional
 
 
-def _fmt_runtime(value) -> str:
+def _fmt_runtime(value) -> Optional[str]:
     """Normalise a runtime value to 'HH:MM:SS' for SGE's h_rt.
 
     Accepts:
@@ -124,6 +124,9 @@ def get_submit_command(
     log_dir   = Path(params.get("log_dir") or str(params.get("log_stdout", "")).rsplit("/", 1)[0])
     run_uuid  = params.get("run_uuid", "0000")
     workdir   = params.get("workdir", "")
+
+    # SGE expects the stdout/stderr log directory to exist already.
+    log_dir.mkdir(parents=True, exist_ok=True)
 
     # ── job name (max 64 chars, must start with letter) ────────────────────
     # Use rule name from resources (or job.name). If generic or missing, add a clear prefix with run UUID.
