@@ -41,7 +41,7 @@ class FakeSettings:
         self.extra: Any = None
         self.join_logs = False
 
-PARAMS = dict(run_uuid="abc123", log_dir="logs", workdir="/work")
+PARAMS = dict(run_uuid="abc123", log_dir="logs", workdir="")
 
 def test_fmt_runtime_whole_hours():   assert _fmt_runtime(120) == "02:00:00"
 def test_fmt_runtime_mixed():         assert _fmt_runtime(75)  == "01:15:00"
@@ -75,6 +75,23 @@ def test_log_dir_is_created(monkeypatch, tmp_path):
     cmd = get_submit_command(FakeJob(), params, FakeSettings(), exec_cmd="/s.sh", is_array=True)
     assert "qsub" in cmd
     assert created == {"path": str(tmp_path / "logs"), "parents": True, "exist_ok": True}
+
+def test_workdir_is_created(monkeypatch, tmp_path):
+    created = []
+
+    def fake_mkdir(self, parents=False, exist_ok=False):
+        created.append({
+            "path": str(self),
+            "parents": parents,
+            "exist_ok": exist_ok,
+        })
+
+    monkeypatch.setattr("pathlib.Path.mkdir", fake_mkdir)
+
+    params = dict(PARAMS, log_dir=str(tmp_path / "logs"), workdir=str(tmp_path / "work"))
+    cmd = get_submit_command(FakeJob(), params, FakeSettings(), exec_cmd="/s.sh", is_array=True)
+    assert "qsub" in cmd
+    assert {"path": str(tmp_path / "work"), "parents": True, "exist_ok": True} in created
 
 def test_array_range():
     p = dict(PARAMS, array_range="3-20")
@@ -187,9 +204,11 @@ def test_no_v_when_export_env_false():
     cmd = get_submit_command(FakeJob(), PARAMS, s, "/s.sh", "1-1")
     assert " -V" not in cmd
 
-def test_workdir():
-    cmd = get_submit_command(FakeJob(), PARAMS, FakeSettings(), "/s.sh", "1-1")
-    assert "-wd /work" in cmd
+def test_workdir(tmp_path):
+    workdir = tmp_path / "work"
+    params = dict(PARAMS, workdir=str(workdir))
+    cmd = get_submit_command(FakeJob(), params, FakeSettings(), "/s.sh", "1-1")
+    assert f"-wd {workdir}" in cmd
 
 def test_no_workdir_uses_cwd():
     p = dict(PARAMS, workdir="")

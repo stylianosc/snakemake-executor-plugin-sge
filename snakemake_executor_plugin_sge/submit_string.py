@@ -127,6 +127,8 @@ def get_submit_command(
 
     # SGE expects the stdout/stderr log directory to exist already.
     log_dir.mkdir(parents=True, exist_ok=True)
+    if workdir:
+        Path(workdir).mkdir(parents=True, exist_ok=True)
 
     # ── job name (max 64 chars, must start with letter) ────────────────────
     # Use rule name from resources (or job.name). If generic or missing, add a clear prefix with run UUID.
