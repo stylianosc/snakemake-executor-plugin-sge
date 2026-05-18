@@ -351,8 +351,8 @@ class Executor(RemoteExecutor):
             )
         self.logger.info(f"SGE run ID: {self.run_uuid}")
 
-        self.sge_logdir = _resolve_logdir(self.workflow)
-        self.sge_logdir.mkdir(parents=True, exist_ok=True)
+        self.sge_logdir_default = _resolve_logdir(self.workflow)
+        self.sge_logdir_default.mkdir(parents=True, exist_ok=True)
 
         self._job_submission_executor = ThreadPoolExecutor(
             max_workers=4, thread_name_prefix="sge_job_submit"
@@ -616,18 +616,37 @@ class Executor(RemoteExecutor):
                 dep_ids.append(base_id)
         return dep_ids
 
+    def _get_job_logdir(self, job: JobExecutorInterface) -> Path:
+        """Get the SGE log directory for a job.
+
+        If the job specifies a workdir resource, place logs in
+        {workdir}/.snakemake/sge_logs. Otherwise use the default logdir.
+        """
+        workdir = job.resources.get("workdir") if hasattr(job, "resources") else None
+        if workdir:
+            return (Path(workdir) / ".snakemake" / "sge_logs").resolve()
+        return self.sge_logdir_default
+
     def run_job(self, job: JobExecutorInterface) -> None:
         """Submit a single job via qsub."""
-        # Log files are stored directly in sge_logdir with job ID
+        # Determine job-specific log directory (uses workdir resource if available)
+        job_logdir = self._get_job_logdir(job)
+        job_logdir.mkdir(parents=True, exist_ok=True)
+
+        # Log files are stored directly in job_logdir with job ID
         # stdout: $JOB_ID.log, stderr: $JOB_ID.error
-        log_stdout = self.sge_logdir / "$JOB_ID.log"
-        log_stderr = self.sge_logdir / "$JOB_ID.error"
+        log_stdout = job_logdir / "$JOB_ID.log"
+        log_stderr = job_logdir / "$JOB_ID.error"
+
+        # Use job's workdir resource if available, else fall back to workflow workdir
+        workdir = job.resources.get("workdir") if hasattr(job, "resources") else None
+        workdir = workdir or self.workflow.workdir_init
 
         job_params = {
             "run_uuid": self.run_uuid,
             "log_stdout": log_stdout,
             "log_stderr": log_stderr,
-            "workdir": self.workflow.workdir_init,
+            "workdir": workdir,
         }
 
         # Resolve upstream SGE job IDs for -hold_jid (needed for --immediate-submit)
@@ -674,15 +693,15 @@ class Executor(RemoteExecutor):
 
         self.logger.info(
             f"Job {job.jobid} submitted as SGE job {sge_jobid} "
-            f"(log: {self.sge_logdir})"
+            f"(log: {job_logdir})"
         )
         self._submitted_job_ids.append(sge_jobid)
         # Record the job→SGE-id mapping BEFORE notifying Snakemake so any
         # downstream submission triggered by the report sees it.
         self._job_to_sge[job] = (sge_jobid, None)
         # Resolve the actual log path now that we have the job ID
-        log_stdout_resolved = self.sge_logdir / f"{sge_jobid}.log"
-        log_stderr_resolved = self.sge_logdir / f"{sge_jobid}.error"
+        log_stdout_resolved = job_logdir / f"{sge_jobid}.log"
+        log_stderr_resolved = job_logdir / f"{sge_jobid}.error"
         self._report_submission_threadsafe(
             SubmittedJobInfo(
                 job,
@@ -724,8 +743,12 @@ class Executor(RemoteExecutor):
             else f"rule_{jobs[0].name}"
         )
 
+        # Determine array-specific log directory from first job's workdir resource
+        first_job_logdir = self._get_job_logdir(jobs[0])
+        first_job_logdir.mkdir(parents=True, exist_ok=True)
+
         # Helper files (manifests, scripts, task maps) are stored in .meta subdirectory
-        meta_dir = self.sge_logdir / ".meta" / group_or_rule
+        meta_dir = first_job_logdir / ".meta" / group_or_rule
         meta_dir.mkdir(parents=True, exist_ok=True)
 
         # Determine the global starting task index for this batch.
@@ -828,11 +851,15 @@ class Executor(RemoteExecutor):
             script_path.write_text(script_content)
             script_path.chmod(0o755)
 
+            # Use first job's workdir resource if available, else fall back to workflow workdir
+            workdir = jobs[0].resources.get("workdir") if hasattr(jobs[0], "resources") else None
+            workdir = workdir or self.workflow.workdir_init
+
             job_params = {
                 "run_uuid": self.run_uuid,
-                "log_stdout": self.sge_logdir / "$JOB_ID.$TASK_ID.log",
-                "log_stderr": self.sge_logdir / "$JOB_ID.$TASK_ID.error",
-                "workdir": self.workflow.workdir_init,
+                "log_stdout": first_job_logdir / "$JOB_ID.$TASK_ID.log",
+                "log_stderr": first_job_logdir / "$JOB_ID.$TASK_ID.error",
+                "workdir": workdir,
                 "array_range": f"{chunk_start}-{chunk_end}",
             }
 
@@ -921,8 +948,9 @@ class Executor(RemoteExecutor):
             # Register each task with Snakemake
             for task_idx, job in enumerate(chunk_jobs, start=chunk_start):
                 external_id = f"{sge_jobid}.{task_idx}"
-                log_o = self.sge_logdir / f"{sge_jobid}.{task_idx}.log"
-                log_e = self.sge_logdir / f"{sge_jobid}.{task_idx}.error"
+                # Each job in the array may have its own logdir; use the first job's for the array
+                log_o = first_job_logdir / f"{sge_jobid}.{task_idx}.log"
+                log_e = first_job_logdir / f"{sge_jobid}.{task_idx}.error"
                 self._report_submission_threadsafe(
                     SubmittedJobInfo(
                         job,
@@ -1052,7 +1080,7 @@ class Executor(RemoteExecutor):
         self.logger.debug(
             f"Cleaning SGE log files older than {age_cutoff} day(s)."
         )
-        for path in self.sge_logdir.rglob("*"):
+        for path in self.sge_logdir_default.rglob("*"):
             if path.is_file():
                 try:
                     if now - path.stat().st_mtime > cutoff_secs:
@@ -1060,7 +1088,7 @@ class Executor(RemoteExecutor):
                 except OSError as exc:
                     self.logger.warning(f"Could not delete log {path}: {exc}")
         # Clean up empty directories
-        for path in sorted(self.sge_logdir.rglob("*"), reverse=True):
+        for path in sorted(self.sge_logdir_default.rglob("*"), reverse=True):
             if path.is_dir():
                 try:
                     path.rmdir()  # Only removes if empty
