@@ -153,7 +153,7 @@ class ExecutorSettings(ExecutorSettingsBase):
         metadata={
             "help": (
                 "Directory for SGE log files.  Defaults to "
-                "'.snakemake/sge_logs' relative to the working directory. "
+                "'.sge_logs' relative to the working directory. "
                 "Absolute paths are used as-is; relative paths are resolved "
                 "against the workflow working directory."
             ),
@@ -306,19 +306,7 @@ def _resolve_logdir(workflow) -> Path:
     elif logdir:
         return Path(workflow.workdir_init) / logdir
     else:
-        return (Path(workflow.workdir_init) / ".snakemake" / "sge_logs").resolve()
-
-
-def _get_job_wildcards(job: JobExecutorInterface) -> str:
-    """Return a filesystem-safe wildcard string for a job."""
-    wc = getattr(job, "wildcards", None)
-    if wc is None:
-        return ""
-    parts = []
-    for k, v in sorted(wc.items()):
-        safe_v = re.sub(r"[^\w.-]", "_", str(v))
-        parts.append(f"{k}={safe_v}")
-    return "__".join(parts)
+        return (Path(workflow.workdir_init) / ".sge_logs").resolve()
 
 
 def _wildcard_sort_key(job: JobExecutorInterface):
@@ -630,15 +618,10 @@ class Executor(RemoteExecutor):
 
     def run_job(self, job: JobExecutorInterface) -> None:
         """Submit a single job via qsub."""
-        group_or_rule = f"group_{job.name}" if job.is_group() else f"rule_{job.name}"
-        wildcard_str = _get_job_wildcards(job)
-
-        logdir = self.sge_logdir / group_or_rule / wildcard_str
-        logdir.mkdir(parents=True, exist_ok=True)
-
-        # SGE uses separate stdout/stderr streams unless -j y is passed
-        log_stdout = logdir / "$JOB_ID.o"
-        log_stderr = logdir / "$JOB_ID.e"
+        # Log files are stored directly in sge_logdir with job ID
+        # stdout: $JOB_ID.log, stderr: $JOB_ID.error
+        log_stdout = self.sge_logdir / "$JOB_ID.log"
+        log_stderr = self.sge_logdir / "$JOB_ID.error"
 
         job_params = {
             "run_uuid": self.run_uuid,
@@ -691,15 +674,15 @@ class Executor(RemoteExecutor):
 
         self.logger.info(
             f"Job {job.jobid} submitted as SGE job {sge_jobid} "
-            f"(log: {logdir})"
+            f"(log: {self.sge_logdir})"
         )
         self._submitted_job_ids.append(sge_jobid)
         # Record the job→SGE-id mapping BEFORE notifying Snakemake so any
         # downstream submission triggered by the report sees it.
         self._job_to_sge[job] = (sge_jobid, None)
         # Resolve the actual log path now that we have the job ID
-        log_stdout_resolved = logdir / f"{sge_jobid}.o"
-        log_stderr_resolved = logdir / f"{sge_jobid}.e"
+        log_stdout_resolved = self.sge_logdir / f"{sge_jobid}.log"
+        log_stderr_resolved = self.sge_logdir / f"{sge_jobid}.error"
         self._report_submission_threadsafe(
             SubmittedJobInfo(
                 job,
@@ -741,8 +724,9 @@ class Executor(RemoteExecutor):
             else f"rule_{jobs[0].name}"
         )
 
-        logdir = self.sge_logdir / group_or_rule
-        logdir.mkdir(parents=True, exist_ok=True)
+        # Helper files (manifests, scripts, task maps) are stored in .meta subdirectory
+        meta_dir = self.sge_logdir / ".meta" / group_or_rule
+        meta_dir.mkdir(parents=True, exist_ok=True)
 
         # Determine the global starting task index for this batch.
         # Successive run_jobs() calls for the same rule each produce a
@@ -782,7 +766,7 @@ class Executor(RemoteExecutor):
             }
             for idx, job in enumerate(jobs, start=global_start)
         }
-        manifest_path = logdir / "task_manifest.json"
+        manifest_path = meta_dir / "task_manifest.json"
         try:
             existing = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
             existing.update(manifest)
@@ -802,7 +786,7 @@ class Executor(RemoteExecutor):
         # Write the complete (cumulative) task map for this rule so all
         # submitted arrays can resolve any task ID.  Named per rule so
         # concurrent rules don't overwrite each other's file.
-        task_map_file = logdir / "task_map.b64"
+        task_map_file = meta_dir / "task_map.b64"
         task_map_file.write_text(task_map_b64)
 
         global_end = global_start + n_tasks - 1
@@ -840,14 +824,14 @@ class Executor(RemoteExecutor):
 
             script_content = "\n".join(script_lines)
 
-            script_path = logdir / f"array_job_{chunk_start}_{chunk_end}.sh"
+            script_path = meta_dir / f"array_job_{chunk_start}_{chunk_end}.sh"
             script_path.write_text(script_content)
             script_path.chmod(0o755)
 
             job_params = {
                 "run_uuid": self.run_uuid,
-                "log_stdout": logdir / "$JOB_ID.$TASK_ID.o",
-                "log_stderr": logdir / "$JOB_ID.$TASK_ID.e",
+                "log_stdout": self.sge_logdir / "$JOB_ID.$TASK_ID.log",
+                "log_stderr": self.sge_logdir / "$JOB_ID.$TASK_ID.error",
                 "workdir": self.workflow.workdir_init,
                 "array_range": f"{chunk_start}-{chunk_end}",
             }
@@ -937,8 +921,8 @@ class Executor(RemoteExecutor):
             # Register each task with Snakemake
             for task_idx, job in enumerate(chunk_jobs, start=chunk_start):
                 external_id = f"{sge_jobid}.{task_idx}"
-                log_o = logdir / f"{sge_jobid}.{task_idx}.o"
-                log_e = logdir / f"{sge_jobid}.{task_idx}.e"
+                log_o = self.sge_logdir / f"{sge_jobid}.{task_idx}.log"
+                log_e = self.sge_logdir / f"{sge_jobid}.{task_idx}.error"
                 self._report_submission_threadsafe(
                     SubmittedJobInfo(
                         job,
