@@ -300,13 +300,16 @@ def get_submit_command(
         f" -N {_safe(job_name)}"
     )
 
-    # Stdout/stderr: pass the log *directory*; SGE appends .oJOBID.TASKID
-    # Use -o dir/ -e dir/ (trailing slash = treat as directory on most SGE)
-    call += f" -o {_safe(str(log_dir) + '/')}"
+    # Stdout/stderr: specify exact log file paths using SGE variable expansion
+    # $JOB_ID expands to the job ID, $TASK_ID expands to the array task index
+    # This produces logs named like "1234567.1.log" (jobid.taskid.log)
+    log_stdout_path = log_dir / "$JOB_ID.$TASK_ID.log"
+    call += f" -o {_safe(str(log_stdout_path))}"
     if join_logs:
         call += " -j y"
     else:
-        call += f" -e {_safe(str(log_dir) + '/')}"
+        log_stderr_path = log_dir / "$JOB_ID.$TASK_ID.error"
+        call += f" -e {_safe(str(log_stderr_path))}"
 
     # ── working directory ──────────────────────────────────────────────
     if workdir:
