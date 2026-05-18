@@ -153,7 +153,7 @@ class ExecutorSettings(ExecutorSettingsBase):
         metadata={
             "help": (
                 "Directory for SGE log files.  Defaults to "
-                "'.sge_logs' relative to the working directory. "
+                "'.snakemake/sge_logs' relative to the working directory. "
                 "Absolute paths are used as-is; relative paths are resolved "
                 "against the workflow working directory."
             ),
@@ -306,7 +306,7 @@ def _resolve_logdir(workflow) -> Path:
     elif logdir:
         return Path(workflow.workdir_init) / logdir
     else:
-        return (Path(workflow.workdir_init) / ".sge_logs").resolve()
+        return (Path(workflow.workdir_init) / ".snakemake" / "sge_logs").resolve()
 
 
 def _wildcard_sort_key(job: JobExecutorInterface):

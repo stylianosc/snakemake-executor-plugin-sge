@@ -90,23 +90,27 @@ Default: 5 attempts. Increase if your cluster has temporary qstat/qacct outages.
 
 ### Directory Structure
 
-All logs are stored in `.sge_logs/` by default:
+All logs are stored in `.snakemake/sge_logs/` by default:
 
 ```
-.sge_logs/
-├── 12345.log               # Single job stdout
-├── 12345.error             # Single job stderr
-├── 12346.1.log             # Array job task 1 stdout
-├── 12346.1.error           # Array job task 1 stderr
-├── 12346.2.log             # Array job task 2 stdout
-├── 12346.2.error           # Array job task 2 stderr
-└── .meta/
-    ├── rule_align/
-    │   ├── task_map.b64    # Encoded task commands
-    │   └── task_manifest.json
-    └── group_process/
-        ├── task_map.b64
-        └── task_manifest.json
+.snakemake/
+├── log/
+├── locks/
+├── metadata/
+└── sge_logs/
+    ├── 12345.log               # Single job stdout
+    ├── 12345.error             # Single job stderr
+    ├── 12346.1.log             # Array job task 1 stdout
+    ├── 12346.1.error           # Array job task 1 stderr
+    ├── 12346.2.log             # Array job task 2 stdout
+    ├── 12346.2.error           # Array job task 2 stderr
+    └── .meta/
+        ├── rule_align/
+        │   ├── task_map.b64    # Encoded task commands
+        │   └── task_manifest.json
+        └── group_process/
+            ├── task_map.b64
+            └── task_manifest.json
 ```
 
 ### Log Cleanup

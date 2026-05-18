@@ -73,12 +73,12 @@ The executor respects the standard Snakemake environment variables. Cluster-spec
 
 ## Log Files
 
-By default, job logs are written to `.sge_logs/` in your working directory:
+By default, job logs are written to `.snakemake/sge_logs/` in your working directory:
 
 - **Single jobs**: `{JOBID}.log` (stdout) and `{JOBID}.error` (stderr)
 - **Array jobs**: `{JOBID}.{TASKID}.log` and `{JOBID}.{TASKID}.error`
 
-Helper files (task manifests and scripts) are stored in `.sge_logs/.meta/`.
+Helper files (task manifests and scripts) are stored in `.snakemake/sge_logs/.meta/`.
 
 You can customize the log directory:
 
