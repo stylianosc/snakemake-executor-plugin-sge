@@ -888,6 +888,7 @@ class Executor(RemoteExecutor):
                 "sys.stdout.write(cmd)",
                 "PYEOF",
                 ")",
+                "echo \"[SGE debug] cmd_len=${#_cmd} bindpath_len=${#APPTAINER_BINDPATH:-0}\" >&2",
                 "eval \"$_cmd\"",
             ]
 
