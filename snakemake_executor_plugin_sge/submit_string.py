@@ -297,7 +297,6 @@ def get_submit_command(
     call = (
         f"qsub"
         f" -S /bin/bash"
-        f" -l stack=unlimited"
         f" -N {_safe(job_name)}"
     )
 
