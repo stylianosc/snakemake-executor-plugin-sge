@@ -671,7 +671,8 @@ class Executor(RemoteExecutor):
                 text=True,
                 stderr=subprocess.STDOUT,
             ).strip()
-            self.logger.debug(out)
+            # Print the qsub confirmation message so the user sees it
+            print(out, flush=True)
         except subprocess.CalledProcessError as e:
             err_msg = f"SGE qsub failed: {e.output.strip()}\n  Command: {call}"
             print(err_msg, flush=True)
@@ -897,7 +898,7 @@ class Executor(RemoteExecutor):
                     text=True,
                     stderr=subprocess.STDOUT,
                 ).strip()
-                self.logger.debug(out)
+                print(out, flush=True)
             except subprocess.CalledProcessError as e:
                 error_msg = (
                     f"SGE qsub array submission failed "
