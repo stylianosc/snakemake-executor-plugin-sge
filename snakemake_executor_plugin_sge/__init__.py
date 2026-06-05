@@ -653,11 +653,38 @@ class Executor(RemoteExecutor):
         dep_ids = self._resolve_sge_dependencies(job)
 
         exec_job = self.format_job_exec(job)
+
+        # Write a wrapper script rather than piping exec_job via echo|qsub.
+        # This lets us inject APPTAINER_BINDPATH before the exec command runs,
+        # mirroring the array-job approach and guarding against ARG_MAX limits.
+        bind_file = Path(self.workflow.workdir_init) / ".snakemake" / "apptainer_bindpath.txt"
+        single_meta_dir = job_logdir / ".meta"
+        single_meta_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = re.sub(r"[^\w-]", "_", job.name)
+        single_script_path = single_meta_dir / f"{safe_name}_{self.run_uuid[:8]}.sh"
+        single_script_path.write_text("\n".join([
+            "#!/bin/bash",
+            "set -euo pipefail",
+            f"# SGE single job for Snakemake rule '{job.name}'",
+            f"# run_uuid={self.run_uuid}",
+            "",
+            "# If a pre-computed bind list exists, export APPTAINER_BINDPATH from it.",
+            "# Apptainer merges this with any --bind flags in the exec command.",
+            f"_bind_file={shlex.quote(str(bind_file))}",
+            "if [ -f \"$_bind_file\" ]; then",
+            "    export APPTAINER_BINDPATH=$(< \"$_bind_file\")",
+            "fi",
+            "",
+            exec_job,
+        ]))
+        single_script_path.chmod(0o755)
+
         call = get_submit_command(
             job,
             job_params,
             settings=self.workflow.executor_settings,
-            exec_cmd=exec_job,
+            exec_cmd=None,
+            script_path=str(single_script_path),
             hold_jid_list=dep_ids,
         )
 
@@ -823,6 +850,7 @@ class Executor(RemoteExecutor):
             chunk_jobs = jobs[local_start:local_end]
 
             kind = "group" if jobs[0].is_group() else "rule"
+            bind_file = Path(self.workflow.workdir_init) / ".snakemake" / "apptainer_bindpath.txt"
             script_lines = [
                 "#!/bin/bash",
                 "set -euo pipefail",
@@ -832,6 +860,14 @@ class Executor(RemoteExecutor):
                 "# Read the task map from the shared filesystem file.",
                 "# Avoids ARG_MAX issues for large arrays (150+ tasks).",
                 f"export TASK_MAP_FILE={shlex.quote(str(task_map_file))}",
+                "",
+                "# If a pre-computed bind list exists, export APPTAINER_BINDPATH from it.",
+                "# Apptainer merges this with any --bind flags already in the exec command,",
+                "# so both mechanisms are honoured simultaneously.",
+                f"_bind_file={shlex.quote(str(bind_file))}",
+                "if [ -f \"$_bind_file\" ]; then",
+                "    export APPTAINER_BINDPATH=$(< \"$_bind_file\")",
+                "fi",
                 "",
                 "# Extract and run the command for this task",
                 "export _tid=${SGE_TASK_ID}",
