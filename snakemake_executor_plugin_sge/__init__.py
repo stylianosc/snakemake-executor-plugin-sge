@@ -743,8 +743,10 @@ class Executor(RemoteExecutor):
             else f"rule_{jobs[0].name}"
         )
 
-        # Determine array-specific log directory from first job's workdir resource
-        first_job_logdir = self._get_job_logdir(jobs[0])
+        # Array jobs share one -o/-e path across all tasks, so per-task workdir
+        # paths are not usable.  Always use the main workflow log directory so
+        # logs from different subjects don't pile up in the first subject's folder.
+        first_job_logdir = self.sge_logdir_default
         first_job_logdir.mkdir(parents=True, exist_ok=True)
 
         # Helper files (manifests, scripts, task maps) are stored in .meta subdirectory
@@ -851,9 +853,10 @@ class Executor(RemoteExecutor):
             script_path.write_text(script_content)
             script_path.chmod(0o755)
 
-            # Use first job's workdir resource if available, else fall back to workflow workdir
-            workdir = jobs[0].resources.get("workdir") if hasattr(jobs[0], "resources") else None
-            workdir = workdir or self.workflow.workdir_init
+            # Use the main workflow workdir for the qsub -wd flag.  Individual
+            # task commands in the task map already carry full absolute paths, so
+            # the array-level working directory only needs to be a valid directory.
+            workdir = str(self.workflow.workdir_init)
 
             job_params = {
                 "run_uuid": self.run_uuid,
