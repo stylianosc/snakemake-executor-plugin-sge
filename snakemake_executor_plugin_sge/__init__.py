@@ -655,9 +655,7 @@ class Executor(RemoteExecutor):
         exec_job = self.format_job_exec(job)
 
         # Write a wrapper script rather than piping exec_job via echo|qsub.
-        # This lets us inject APPTAINER_BINDPATH before the exec command runs,
-        # mirroring the array-job approach and guarding against ARG_MAX limits.
-        bind_file = Path(self.workflow.workdir_init) / ".snakemake" / "apptainer_bindpath.txt"
+        # Script-based submission is cleaner and avoids shell quoting edge-cases.
         single_meta_dir = job_logdir / ".meta"
         single_meta_dir.mkdir(parents=True, exist_ok=True)
         safe_name = re.sub(r"[^\w-]", "_", job.name)
@@ -667,17 +665,6 @@ class Executor(RemoteExecutor):
             "set -euo pipefail",
             f"# SGE single job for Snakemake rule '{job.name}'",
             f"# run_uuid={self.run_uuid}",
-            "",
-            "# Raise the effective ARG_MAX (1/4 of stack size on Linux) so that",
-            "# large --apptainer-args strings don't trigger 'Argument list too long'.",
-            "ulimit -s unlimited",
-            "",
-            "# If a pre-computed bind list exists, export APPTAINER_BINDPATH from it.",
-            "# Apptainer merges this with any --bind flags in the exec command.",
-            f"_bind_file={shlex.quote(str(bind_file))}",
-            "if [ -f \"$_bind_file\" ]; then",
-            "    export APPTAINER_BINDPATH=$(< \"$_bind_file\")",
-            "fi",
             "",
             exec_job,
         ]))
@@ -854,7 +841,6 @@ class Executor(RemoteExecutor):
             chunk_jobs = jobs[local_start:local_end]
 
             kind = "group" if jobs[0].is_group() else "rule"
-            bind_file = Path(self.workflow.workdir_init) / ".snakemake" / "apptainer_bindpath.txt"
             script_lines = [
                 "#!/bin/bash",
                 "set -euo pipefail",
@@ -865,10 +851,7 @@ class Executor(RemoteExecutor):
                 "# Avoids ARG_MAX issues for large arrays (150+ tasks).",
                 f"export TASK_MAP_FILE={shlex.quote(str(task_map_file))}",
                 "",
-                "# Decode the exec command for this task BEFORE setting APPTAINER_BINDPATH.",
-                "# The python3 subprocess here runs in a small environment; if we set",
-                "# APPTAINER_BINDPATH first (potentially hundreds of KB), the execve() call",
-                "# for this python3 would itself fail with 'Argument list too long'.",
+                "# Decode the exec command for this task from the task map file.",
                 "export _tid=${SGE_TASK_ID}",
                 "_cmd=$(",
                 "  python3 - <<'PYEOF'",
@@ -879,13 +862,6 @@ class Executor(RemoteExecutor):
                 "sys.stdout.write(cmd)",
                 "PYEOF",
                 ")",
-                "",
-                "# Now safe to load the large bind list into APPTAINER_BINDPATH.",
-                "# Apptainer reads this env var alongside any --bind flags in the exec command.",
-                f"_bind_file={shlex.quote(str(bind_file))}",
-                "if [ -f \"$_bind_file\" ]; then",
-                "    export APPTAINER_BINDPATH=$(< \"$_bind_file\")",
-                "fi",
                 "",
                 "eval \"$_cmd\"",
             ]
