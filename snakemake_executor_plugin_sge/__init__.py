@@ -518,6 +518,26 @@ class Executor(RemoteExecutor):
                 f"will be applied to every task."
             )
 
+    def _get_singularity_bind(self) -> str:
+        """Extract the bind-mount value from DeploymentSettings.apptainer_args.
+
+        Snakemake does not forward apptainer_args into the serialised remote
+        exec command, so the SGE plugin must set SINGULARITY_BINDPATH (used by
+        Singularity 3.x) and APPTAINER_BINDPATH (used by Apptainer 1.x) in the
+        job script before the eval step so the container sees the correct mounts.
+
+        Returns the bind-mount value string (e.g. "/a:/b,/c:/d") or "" if
+        no --bind flag is present in apptainer_args.
+        """
+        apptainer_args: str = getattr(
+            self.workflow.deployment_settings, "apptainer_args", ""
+        ) or ""
+        # apptainer_args is a raw string like "--bind /a:/b,/c:/d --other-flag"
+        # Locate "--bind" and capture everything up to the next "--" flag (or end).
+        import re as _re
+        match = _re.search(r"--bind\s+(\S+)", apptainer_args)
+        return match.group(1) if match else ""
+
     def _resolve_array_holds(
         self,
         chunk_jobs: List[JobExecutorInterface],
@@ -659,6 +679,21 @@ class Executor(RemoteExecutor):
         single_meta_dir = job_logdir / ".meta"
         single_meta_dir.mkdir(parents=True, exist_ok=True)
         safe_name = re.sub(r"[^\w-]", "_", job.name)
+
+        # Snakemake does not forward DeploymentSettings.apptainer_args into the
+        # serialised remote exec command, so we inject the bind list via env vars
+        # that Singularity (SINGULARITY_BINDPATH) and Apptainer (APPTAINER_BINDPATH)
+        # both honour.  The bind list is tiny after common-ancestor consolidation.
+        singularity_bind = self._get_singularity_bind()
+        bind_lines: list[str] = []
+        if singularity_bind:
+            quoted = shlex.quote(singularity_bind)
+            bind_lines = [
+                f"export SINGULARITY_BINDPATH={quoted}",
+                f"export APPTAINER_BINDPATH={quoted}",
+                "",
+            ]
+
         single_script_path = single_meta_dir / f"{safe_name}_{self.run_uuid[:8]}.sh"
         single_script_path.write_text("\n".join([
             "#!/bin/bash",
@@ -666,6 +701,7 @@ class Executor(RemoteExecutor):
             f"# SGE single job for Snakemake rule '{job.name}'",
             f"# run_uuid={self.run_uuid}",
             "",
+            *bind_lines,
             exec_job,
         ]))
         single_script_path.chmod(0o755)
@@ -841,6 +877,23 @@ class Executor(RemoteExecutor):
             chunk_jobs = jobs[local_start:local_end]
 
             kind = "group" if jobs[0].is_group() else "rule"
+
+            # Snakemake does not forward DeploymentSettings.apptainer_args into the
+            # serialised remote exec command.  Inject the bind list via SINGULARITY_BINDPATH
+            # (Singularity 3.x) and APPTAINER_BINDPATH (Apptainer 1.x) so the container
+            # sees the correct mounts.  The bind list is tiny after consolidation.
+            singularity_bind = self._get_singularity_bind()
+            bind_script_lines: list[str] = []
+            if singularity_bind:
+                quoted = shlex.quote(singularity_bind)
+                bind_script_lines = [
+                    "# Inject bind mounts — Snakemake does not serialise apptainer_args",
+                    "# into the remote exec command, so we set both env var names here.",
+                    f"export SINGULARITY_BINDPATH={quoted}",
+                    f"export APPTAINER_BINDPATH={quoted}",
+                    "",
+                ]
+
             script_lines = [
                 "#!/bin/bash",
                 "set -euo pipefail",
@@ -863,6 +916,7 @@ class Executor(RemoteExecutor):
                 "PYEOF",
                 ")",
                 "",
+                *bind_script_lines,
                 "eval \"$_cmd\"",
             ]
 
