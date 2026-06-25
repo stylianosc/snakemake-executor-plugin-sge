@@ -372,16 +372,13 @@ class Executor(RemoteExecutor):
         # need it).
         self._job_to_sge: "dict[JobExecutorInterface, tuple]" = {}
 
-        # Per-rule task index offset: tracks how many tasks have been submitted
-        # for each rule so far.  When Snakemake batches run_jobs() calls for
-        # the same rule, each batch's SGE_TASK_IDs continue from where the
-        # previous batch left off, keeping them consistent with the task map.
-        self._rule_task_offset: "dict[str, int]" = {}
-        # Per-rule accumulated task map (task_id → b64-zlib-cmd).  Grown
-        # across batches so all arrays for a rule share one task_map.b64 file
-        # and any task can resolve its command regardless of which array it
-        # landed in.
-        self._rule_task_map: "dict[str, dict]" = {}
+        # Per-rule wave counter: each run_array_job() call for a given rule is
+        # a new "wave".  Tasks always start at 1 within a wave so that a
+        # downstream wave whose subjects align 1:1 with an upstream wave can
+        # use -hold_jid_ad (per-task hold) instead of -hold_jid (whole-array
+        # hold).  A separate task_map file per wave avoids key collisions
+        # between waves of the same rule.
+        self._rule_wave_count: "dict[str, int]" = {}
 
         atexit.register(self.clean_old_logs)
 
@@ -424,10 +421,9 @@ class Executor(RemoteExecutor):
         Regular (non-group) jobs are bucketed by rule name and submitted as
         SGE array jobs.  When Snakemake calls run_jobs() multiple times for
         the same rule (batching behaviour under --immediate-submit), each
-        call produces a separate array submission.  Task IDs are globally
-        consecutive across calls (tracked via _rule_task_offset) so that
-        SGE_TASK_ID always maps to the correct entry in the shared task map
-        file, and -hold_jid_ad indices remain consistent.
+        call produces a separate array submission (a "wave").  Task IDs
+        always start at 1 within each wave so that a downstream wave whose
+        subjects align 1:1 with an upstream wave can use -hold_jid_ad.
         """
         if self._main_event_loop is None:
             try:
@@ -772,33 +768,28 @@ class Executor(RemoteExecutor):
         meta_dir = first_job_logdir / ".meta" / group_or_rule
         meta_dir.mkdir(parents=True, exist_ok=True)
 
-        # Determine the global starting task index for this batch.
-        # Successive run_jobs() calls for the same rule each produce a
-        # separate run_array_job() invocation.  Without a global offset the
-        # second batch would number its tasks 1..50 again, but SGE assigns
-        # them 51..100, causing KeyError when the script looks up "51" in a
-        # map that only contains "1".."50".
+        # Each run_array_job() call is a new "wave" for this rule.  Task IDs
+        # always start at 1 within a wave so that a downstream wave whose
+        # subjects match 1:1 with an upstream wave (same set, same sort order)
+        # can use -hold_jid_ad (per-task hold) instead of -hold_jid
+        # (whole-array hold).  A per-wave task_map file avoids key collisions
+        # between waves of the same rule — each submission script is already
+        # baked with the path to its own wave's file.
         rule_key = group_or_rule
-        global_start = self._rule_task_offset.get(rule_key, 0) + 1
+        wave_num = self._rule_wave_count.get(rule_key, 0) + 1
+        self._rule_wave_count[rule_key] = wave_num
         n_tasks = len(jobs)
-        self._rule_task_offset[rule_key] = global_start + n_tasks - 1
 
-        # Build the compressed task → command map using globally consecutive
-        # task IDs so SGE_TASK_ID always matches the map key.
+        # Build the compressed task → command map with 1-based task IDs local
+        # to this wave.  SGE_TASK_ID will be in [1, n_tasks] for this array.
         task_map = {
             str(idx): base64.b64encode(
                 zlib.compress(self.format_job_exec(job).encode("utf-8"), level=9)
             ).decode()
-            for idx, job in enumerate(jobs, start=global_start)
+            for idx, job in enumerate(jobs, start=1)
         }
-
-        # Accumulate into the per-rule task map and (re)write the shared file
-        # so all arrays for this rule can read the complete map.
-        if rule_key not in self._rule_task_map:
-            self._rule_task_map[rule_key] = {}
-        self._rule_task_map[rule_key].update(task_map)
         task_map_b64 = base64.b64encode(
-            json.dumps(self._rule_task_map[rule_key]).encode()
+            json.dumps(task_map).encode()
         ).decode()
 
         # Manifest: human-readable record of task ID → wildcards for debugging.
@@ -808,13 +799,11 @@ class Executor(RemoteExecutor):
                 "wildcards": dict(job.wildcards) if getattr(job, "wildcards", None) else {},
                 "is_group": job.is_group(),
             }
-            for idx, job in enumerate(jobs, start=global_start)
+            for idx, job in enumerate(jobs, start=1)
         }
-        manifest_path = meta_dir / "task_manifest.json"
+        manifest_path = meta_dir / f"task_manifest_wave{wave_num}.json"
         try:
-            existing = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
-            existing.update(manifest)
-            manifest_path.write_text(json.dumps(existing, indent=2))
+            manifest_path.write_text(json.dumps(manifest, indent=2))
         except OSError as exc:
             self.logger.debug(f"Could not write task manifest {manifest_path}: {exc}")
 
@@ -827,18 +816,16 @@ class Executor(RemoteExecutor):
         settings = self.workflow.executor_settings
         array_limit = settings.array_limit
 
-        # Write the complete (cumulative) task map for this rule so all
-        # submitted arrays can resolve any task ID.  Named per rule so
-        # concurrent rules don't overwrite each other's file.
-        task_map_file = meta_dir / "task_map.b64"
+        # Write this wave's task map.  Named per wave so concurrent or
+        # successive waves of the same rule don't overwrite each other.
+        task_map_file = meta_dir / f"task_map_wave{wave_num}.b64"
         task_map_file.write_text(task_map_b64)
 
-        global_end = global_start + n_tasks - 1
-        for chunk_start in range(global_start, global_end + 1, array_limit):
-            chunk_end = min(chunk_start + array_limit - 1, global_end)
-            # Convert global task indices back to local slice indices (0-based)
-            local_start = chunk_start - global_start
-            local_end = chunk_end - global_start + 1
+        for chunk_start in range(1, n_tasks + 1, array_limit):
+            chunk_end = min(chunk_start + array_limit - 1, n_tasks)
+            # Convert 1-based task indices to 0-based slice indices into jobs.
+            local_start = chunk_start - 1
+            local_end = chunk_end
             chunk_jobs = jobs[local_start:local_end]
 
             kind = "group" if jobs[0].is_group() else "rule"
