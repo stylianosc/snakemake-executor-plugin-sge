@@ -678,19 +678,19 @@ class Executor(RemoteExecutor):
 
         self.logger.debug(f"qsub call: {call}")
         try:
-            # We use check_output to get the job ID but we also want to show
-            # the output to the user for confirmation.
             out = subprocess.check_output(
                 call,
                 shell=True,
                 text=True,
                 stderr=subprocess.STDOUT,
             ).strip()
-            # Print the qsub confirmation message so the user sees it
-            print(out, flush=True)
+            # Route qsub confirmation through Snakemake's logger so it lands
+            # in the .snakemake log file and respects quiet/verbosity settings
+            # rather than always printing to stdout.
+            self.logger.info(out)
         except subprocess.CalledProcessError as e:
             err_msg = f"SGE qsub failed: {e.output.strip()}\n  Command: {call}"
-            print(err_msg, flush=True)
+            self.logger.error(err_msg)
             self._report_error_threadsafe(
                 SubmittedJobInfo(job),
                 err_msg,
@@ -908,7 +908,7 @@ class Executor(RemoteExecutor):
                     text=True,
                     stderr=subprocess.STDOUT,
                 ).strip()
-                print(out, flush=True)
+                self.logger.info(out)
             except subprocess.CalledProcessError as e:
                 error_msg = (
                     f"SGE qsub array submission failed "
