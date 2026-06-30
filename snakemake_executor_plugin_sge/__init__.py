@@ -525,14 +525,16 @@ class Executor(RemoteExecutor):
         -------
         (hold_jid_ad, hold_jid_list)
 
-        ``hold_jid_ad`` is the base SGE job ID of a single upstream array
-        when every chunk task has exactly one upstream task and the
-        upstream task index matches the downstream task index (the
-        contract enforced by qsub's -hold_jid_ad).
+        ``hold_jid_ad`` is a comma-separated string of upstream array job IDs
+        when every downstream task N maps exactly to task N of every upstream
+        array.  SGE accepts a comma-separated list for -hold_jid_ad, so
+        multiple upstream arrays (e.g. recon-all AND thalamic_seg both feeding
+        tracula) are handled correctly — each tracula task N starts the moment
+        its specific recon-all task N AND thalamic_seg task N both finish.
 
-        Otherwise ``hold_jid_ad`` is None and ``hold_jid_list`` carries
-        all the upstream array job IDs to pass to plain -hold_jid (whole
-        upstream array(s) must finish first).
+        Otherwise ``hold_jid_ad`` is None and ``hold_jid_list`` carries all
+        the upstream array job IDs to pass to plain -hold_jid (whole upstream
+        array(s) must finish before any downstream task starts).
         """
         # Collect each chunk task's upstreams.  Each entry is a list of
         # (sge_jobid, task_idx) tuples; task_idx is None when the
@@ -550,30 +552,36 @@ class Executor(RemoteExecutor):
         if not all_base_ids:
             return (None, [])
 
-        # -hold_jid_ad eligibility: every chunk task has exactly one
-        # upstream, all upstreams share a single array job, and each
-        # upstream task index equals the downstream task index.
-        if len(all_base_ids) != 1:
-            return (None, all_base_ids)
-        upstream_base = all_base_ids[0]
-
+        # -hold_jid_ad eligibility: for every downstream chunk task, each
+        # upstream must be an array job and its task index must equal the
+        # downstream task index.  Every upstream base ID must appear exactly
+        # once per downstream task (no missing or extra upstreams per task).
+        # SGE's -hold_jid_ad accepts a comma-separated list, so multiple
+        # upstream arrays that all satisfy the 1:1 contract are eligible.
+        all_base_set = set(all_base_ids)
+        eligible = True
         for offset, entries in enumerate(per_task):
-            if len(entries) != 1:
-                return (None, all_base_ids)
-            sge_jobid, task_idx = entries[0]
-            if task_idx is None:
-                # Upstream was a single (non-array) submission.
-                # -hold_jid_ad needs an array on both sides.
-                return (None, all_base_ids)
-            if sge_jobid != upstream_base:
-                return (None, all_base_ids)
-            if task_idx != chunk_start + offset:
-                return (None, all_base_ids)
+            expected_idx = chunk_start + offset
+            seen: set = set()
+            for sge_jobid, task_idx in entries:
+                if task_idx is None or task_idx != expected_idx:
+                    # Non-array upstream or mismatched index — can't use
+                    # -hold_jid_ad.
+                    eligible = False
+                    break
+                seen.add(sge_jobid)
+            if not eligible or seen != all_base_set:
+                eligible = False
+                break
 
-        self.logger.debug(
-            f"Array chunk eligible for -hold_jid_ad on {upstream_base}"
-        )
-        return (upstream_base, [])
+        if eligible:
+            hold_ad = ",".join(all_base_ids)
+            self.logger.debug(
+                f"Array chunk eligible for -hold_jid_ad on {hold_ad}"
+            )
+            return (hold_ad, [])
+
+        return (None, all_base_ids)
 
     def _upstream_ext_ids(self, job):
         """Yield ``(upstream_job, sge_jobid, task_idx)`` for each upstream.
