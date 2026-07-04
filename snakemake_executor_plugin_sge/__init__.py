@@ -372,13 +372,13 @@ class Executor(RemoteExecutor):
         # need it).
         self._job_to_sge: "dict[JobExecutorInterface, tuple]" = {}
 
-        # Per-rule wave counter: each run_array_job() call for a given rule is
-        # a new "wave".  Tasks always start at 1 within a wave so that a
-        # downstream wave whose subjects align 1:1 with an upstream wave can
-        # use -hold_jid_ad (per-task hold) instead of -hold_jid (whole-array
-        # hold).  A separate task_map file per wave avoids key collisions
-        # between waves of the same rule.
-        self._rule_wave_count: "dict[str, int]" = {}
+        # Per-rule wave tracking: each run_array_job() call for a given rule is
+        # a new "wave".  Task IDs continue globally across waves (wave 2 picks
+        # up where wave 1 ended) so that -hold_jid_ad alignment is preserved
+        # for per-subject downstream parallelism.  A separate task_map file per
+        # wave avoids key collisions between waves of the same rule.
+        self._rule_wave_num: "dict[str, int]" = {}   # wave counter per rule (for file naming)
+        self._rule_task_end: "dict[str, int]" = {}   # global task-end per rule (for 1:1 holds)
 
         atexit.register(self.clean_old_logs)
 
@@ -422,8 +422,8 @@ class Executor(RemoteExecutor):
         SGE array jobs.  When Snakemake calls run_jobs() multiple times for
         the same rule (batching behaviour under --immediate-submit), each
         call produces a separate array submission (a "wave").  Task IDs
-        always start at 1 within each wave so that a downstream wave whose
-        subjects align 1:1 with an upstream wave can use -hold_jid_ad.
+        continue globally across waves so that downstream rules can use
+        -hold_jid_ad for per-subject parallelism regardless of wave boundaries.
         """
         if self._main_event_loop is None:
             try:
@@ -777,24 +777,36 @@ class Executor(RemoteExecutor):
         meta_dir.mkdir(parents=True, exist_ok=True)
 
         # Each run_array_job() call is a new "wave" for this rule.  Task IDs
-        # always start at 1 within a wave so that a downstream wave whose
-        # subjects match 1:1 with an upstream wave (same set, same sort order)
-        # can use -hold_jid_ad (per-task hold) instead of -hold_jid
-        # (whole-array hold).  A per-wave task_map file avoids key collisions
-        # between waves of the same rule — each submission script is already
-        # baked with the path to its own wave's file.
+        # continue from where the previous wave of the same rule ended so that
+        # downstream rules can always use -hold_jid_ad for per-subject
+        # parallelism: SGE aligns task N of the downstream with task N of the
+        # upstream, and that mapping is only valid when every rule uses a single
+        # consistent global numbering scheme.  A per-wave task_map file avoids
+        # key collisions between waves — each submission script is baked with
+        # the path to its own wave's file.
         rule_key = group_or_rule
-        wave_num = self._rule_wave_count.get(rule_key, 0) + 1
-        self._rule_wave_count[rule_key] = wave_num
+        wave_num = self._rule_wave_num.get(rule_key, 0) + 1
+        self._rule_wave_num[rule_key] = wave_num
         n_tasks = len(jobs)
 
-        # Build the compressed task → command map with 1-based task IDs local
-        # to this wave.  SGE_TASK_ID will be in [1, n_tasks] for this array.
+        # Assign globally-continuing task IDs across successive waves of the
+        # same rule.  This is critical for -hold_jid_ad (per-task hold): SGE
+        # makes downstream task N wait only for upstream task N, so both sides
+        # must use the same numbering scheme.  Restarting at 1 each wave breaks
+        # that alignment when multiple upstream waves exist, causing the executor
+        # to fall back to -hold_jid (whole-array hold), defeating subject-level
+        # parallelism.
+        wave_start = self._rule_task_end.get(rule_key, 0) + 1
+        wave_end = wave_start + n_tasks - 1
+        self._rule_task_end[rule_key] = wave_end
+
+        # Build the compressed task → command map keyed by global task IDs.
+        # SGE_TASK_ID will be in [wave_start, wave_end] for this array.
         task_map = {
             str(idx): base64.b64encode(
                 zlib.compress(self.format_job_exec(job).encode("utf-8"), level=9)
             ).decode()
-            for idx, job in enumerate(jobs, start=1)
+            for idx, job in enumerate(jobs, start=wave_start)
         }
         task_map_b64 = base64.b64encode(
             json.dumps(task_map).encode()
@@ -807,7 +819,7 @@ class Executor(RemoteExecutor):
                 "wildcards": dict(job.wildcards) if getattr(job, "wildcards", None) else {},
                 "is_group": job.is_group(),
             }
-            for idx, job in enumerate(jobs, start=1)
+            for idx, job in enumerate(jobs, start=wave_start)
         }
         manifest_path = meta_dir / f"task_manifest_wave{wave_num}.json"
         try:
@@ -829,11 +841,11 @@ class Executor(RemoteExecutor):
         task_map_file = meta_dir / f"task_map_wave{wave_num}.b64"
         task_map_file.write_text(task_map_b64)
 
-        for chunk_start in range(1, n_tasks + 1, array_limit):
-            chunk_end = min(chunk_start + array_limit - 1, n_tasks)
-            # Convert 1-based task indices to 0-based slice indices into jobs.
-            local_start = chunk_start - 1
-            local_end = chunk_end
+        for chunk_start in range(wave_start, wave_end + 1, array_limit):
+            chunk_end = min(chunk_start + array_limit - 1, wave_end)
+            # Convert global task indices to 0-based slice indices into jobs.
+            local_start = chunk_start - wave_start
+            local_end = local_start + (chunk_end - chunk_start + 1)
             chunk_jobs = jobs[local_start:local_end]
 
             kind = "group" if jobs[0].is_group() else "rule"
