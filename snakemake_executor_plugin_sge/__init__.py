@@ -37,7 +37,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Generator, List, Optional
+from typing import Dict, Generator, List, Optional, Tuple
 import re
 import shlex
 import subprocess
@@ -540,26 +540,39 @@ class Executor(RemoteExecutor):
         return self._subject_to_idx[key]
 
     @staticmethod
-    def _ids_to_sge_task_spec(ids: List[int]) -> str:
-        """Convert a list of task IDs to a compact SGE -t range spec.
+    def _split_contiguous_ranges(
+        ids: List[int],
+    ) -> List[Tuple[int, int, List[int]]]:
+        """Split a list of global subject indices into maximal contiguous runs.
 
-        Consecutive IDs are collapsed into ranges.
-        E.g. [1, 2, 3, 7, 8, 42] → '1-3,7-8,42'.
-        SGE/UGE support comma-separated ranges in the -t flag.
+        Returns a list of ``(range_start, range_end, ids_in_range)`` tuples.
+        Used to work around the UCL cluster SGE/UGE restriction that the -t
+        flag accepts only a single range specification — comma-separated
+        multi-range specs (e.g. ``572-574,576-579``) are rejected with
+        "qsub: -t option only allows one range specification".
+
+        Each contiguous run is submitted as a separate qsub array job with
+        ``-t range_start-range_end``.  The global subject index is preserved
+        as the SGE task ID within each sub-job, so ``-hold_jid_ad`` alignment
+        between rules is maintained: downstream task N always refers to the
+        same subject as upstream task N across all sub-jobs.
         """
         sorted_ids = sorted(set(ids))
         if not sorted_ids:
-            return "1-1"
-        ranges: List[str] = []
+            return []
+        ranges: List[Tuple[int, int, List[int]]] = []
         start = end = sorted_ids[0]
+        run: List[int] = [sorted_ids[0]]
         for i in sorted_ids[1:]:
             if i == end + 1:
                 end = i
+                run.append(i)
             else:
-                ranges.append(str(start) if start == end else f"{start}-{end}")
+                ranges.append((start, end, run))
                 start = end = i
-        ranges.append(str(start) if start == end else f"{start}-{end}")
-        return ",".join(ranges)
+                run = [i]
+        ranges.append((start, end, run))
+        return ranges
 
     def _resolve_array_holds(
         self,
@@ -835,127 +848,151 @@ class Executor(RemoteExecutor):
         kind = "group" if jobs[0].is_group() else "rule"
         workdir = str(self.workflow.workdir_init)
 
-        # Submit in chunks of at most array_limit tasks each.
+        # Submit in chunks of at most array_limit tasks each.  Within each
+        # chunk, further split non-contiguous index sets into separate qsub
+        # calls — this cluster's SGE/UGE rejects comma-separated multi-range
+        # -t specifications with "qsub: -t option only allows one range
+        # specification".  Each contiguous sub-range is its own array job,
+        # which preserves the global subject index as the SGE task ID and
+        # therefore keeps -hold_jid_ad alignment across rules intact.
         for sub_chunk, chunk_offset in enumerate(range(0, len(jobs), array_limit), start=1):
             chunk_jobs = jobs[chunk_offset:chunk_offset + array_limit]
             chunk_idxs = subject_idxs[chunk_offset:chunk_offset + array_limit]
-            task_spec = self._ids_to_sge_task_spec(chunk_idxs)
 
-            script_lines = [
-                "#!/bin/bash",
-                "set -euo pipefail",
-                f"# SGE array job for Snakemake {kind} '{jobs[0].name}'",
-                f"# run_uuid={self.run_uuid}",
-                "",
-                "# Read the task map from the shared filesystem file.",
-                "# Avoids ARG_MAX issues for large arrays (150+ tasks).",
-                f"export TASK_MAP_FILE={shlex.quote(str(task_map_file))}",
-                "",
-                "# Decode the exec command for this task from the task map.",
-                "# $SGE_TASK_ID is the global subject index for this task.",
-                "export _tid=${SGE_TASK_ID}",
-                "_cmd=$(",
-                "  python3 - <<'PYEOF'",
-                "import sys, base64, zlib, json, os",
-                "task_map = json.loads(base64.b64decode(open(os.environ['TASK_MAP_FILE']).read()))",
-                "tid = str(os.environ['_tid'])",
-                "cmd = zlib.decompress(base64.b64decode(task_map[tid])).decode()",
-                "sys.stdout.write(cmd)",
-                "PYEOF",
-                ")",
-                "",
-                "eval \"$_cmd\"",
-            ]
+            idx_to_job = dict(zip(chunk_idxs, chunk_jobs))
+            sub_ranges = self._split_contiguous_ranges(chunk_idxs)
 
-            script_path = meta_dir / f"array_job_chunk{chunk_num}_{sub_chunk}.sh"
-            script_path.write_text("\n".join(script_lines))
-            script_path.chmod(0o755)
+            for sub_range_num, (sub_start, sub_end, sub_idxs) in enumerate(sub_ranges, start=1):
+                sub_jobs = [idx_to_job[i] for i in sub_idxs]
 
-            job_params = {
-                "run_uuid": self.run_uuid,
-                "log_stdout": first_job_logdir / "$JOB_ID.$TASK_ID.log",
-                "log_stderr": first_job_logdir / "$JOB_ID.$TASK_ID.error",
-                "workdir": workdir,
-                "array_range": task_spec,
-            }
-
-            hold_ad_id, hold_ids = self._resolve_array_holds(chunk_jobs)
-
-            call = get_submit_command(
-                chunk_jobs[0],
-                job_params,
-                settings=settings,
-                exec_cmd=None,
-                script_path=str(script_path),
-                is_array=True,
-                hold_jid_list=hold_ids,
-                hold_jid_ad_override=hold_ad_id,
-            )
-
-            self.logger.debug(f"qsub array call: {call}")
-            try:
-                out = subprocess.check_output(
-                    call,
-                    shell=True,
-                    text=True,
-                    stderr=subprocess.STDOUT,
-                ).strip()
-                self.logger.info(out)
-            except subprocess.CalledProcessError as e:
-                error_msg = (
-                    f"SGE qsub array submission failed (tasks {task_spec}): "
-                    f"{e.output.strip()}\n  Command: {call}"
+                # SGE -t accepts either a single ID or a start-end range.
+                task_spec = (
+                    str(sub_start)
+                    if sub_start == sub_end
+                    else f"{sub_start}-{sub_end}"
                 )
-                self.logger.error(error_msg)
-                for job in chunk_jobs:
-                    self._report_error_threadsafe(
-                        SubmittedJobInfo(job),
-                        f"Part of failed array qsub submission (tasks {task_spec}); see log.",
-                    )
-                continue
 
-            sge_jobid = _parse_qsub_jobid(out)
-            if sge_jobid is None:
-                self.logger.error(f"Could not parse SGE array job ID from: {out!r}")
-                for job in chunk_jobs:
-                    self._report_error_threadsafe(
-                        SubmittedJobInfo(job),
-                        f"Could not parse SGE job ID from qsub output: {out!r}",
-                    )
-                continue
+                script_lines = [
+                    "#!/bin/bash",
+                    "set -euo pipefail",
+                    f"# SGE array job for Snakemake {kind} '{jobs[0].name}'",
+                    f"# run_uuid={self.run_uuid}",
+                    "",
+                    "# Read the task map from the shared filesystem file.",
+                    "# Avoids ARG_MAX issues for large arrays (150+ tasks).",
+                    f"export TASK_MAP_FILE={shlex.quote(str(task_map_file))}",
+                    "",
+                    "# Decode the exec command for this task from the task map.",
+                    "# $SGE_TASK_ID is the global subject index for this task.",
+                    "export _tid=${SGE_TASK_ID}",
+                    "_cmd=$(",
+                    "  python3 - <<'PYEOF'",
+                    "import sys, base64, zlib, json, os",
+                    "task_map = json.loads(base64.b64decode(open(os.environ['TASK_MAP_FILE']).read()))",
+                    "tid = str(os.environ['_tid'])",
+                    "cmd = zlib.decompress(base64.b64decode(task_map[tid])).decode()",
+                    "sys.stdout.write(cmd)",
+                    "PYEOF",
+                    ")",
+                    "",
+                    "eval \"$_cmd\"",
+                ]
 
-            self._submitted_job_ids.append(sge_jobid)
-            hold_msg = ""
-            if hold_ad_id:
-                hold_msg += f" -hold_jid_ad {hold_ad_id}"
-            if hold_ids:
-                hold_msg += f" -hold_jid {','.join(hold_ids)}"
-            self.logger.info(
-                f"Submitted SGE array job {sge_jobid} "
-                f"for {kind} '{jobs[0].name}' "
-                f"(tasks {task_spec}){hold_msg}."
-            )
-
-            # Record global subject index in _job_to_sge BEFORE notifying
-            # Snakemake so downstream submissions see the mapping immediately.
-            for idx, job in zip(chunk_idxs, chunk_jobs):
-                self._job_to_sge[job] = (sge_jobid, idx)
-
-            for idx, job in zip(chunk_idxs, chunk_jobs):
-                external_id = f"{sge_jobid}.{idx}"
-                log_o = first_job_logdir / f"{sge_jobid}.{idx}.log"
-                log_e = first_job_logdir / f"{sge_jobid}.{idx}.error"
-                self._report_submission_threadsafe(
-                    SubmittedJobInfo(
-                        job,
-                        external_jobid=external_id,
-                        aux={
-                            "log_stdout": log_o,
-                            "log_stderr": log_e,
-                            "submit_time": time.time(),
-                        },
-                    )
+                script_path = (
+                    meta_dir / f"array_job_chunk{chunk_num}_{sub_chunk}_{sub_range_num}.sh"
                 )
+                script_path.write_text("\n".join(script_lines))
+                script_path.chmod(0o755)
+
+                job_params = {
+                    "run_uuid": self.run_uuid,
+                    "log_stdout": first_job_logdir / "$JOB_ID.$TASK_ID.log",
+                    "log_stderr": first_job_logdir / "$JOB_ID.$TASK_ID.error",
+                    "workdir": workdir,
+                    "array_range": task_spec,
+                }
+
+                # Resolve holds per sub-range: each sub-job's upstream tasks
+                # may have been submitted in a different upstream sub-range
+                # job, so _resolve_array_holds returns the exact SGE job IDs
+                # that cover the subjects in this sub-range.
+                hold_ad_id, hold_ids = self._resolve_array_holds(sub_jobs)
+
+                call = get_submit_command(
+                    sub_jobs[0],
+                    job_params,
+                    settings=settings,
+                    exec_cmd=None,
+                    script_path=str(script_path),
+                    is_array=True,
+                    hold_jid_list=hold_ids,
+                    hold_jid_ad_override=hold_ad_id,
+                )
+
+                self.logger.debug(f"qsub array call (sub-range {task_spec}): {call}")
+                try:
+                    out = subprocess.check_output(
+                        call,
+                        shell=True,
+                        text=True,
+                        stderr=subprocess.STDOUT,
+                    ).strip()
+                    self.logger.info(out)
+                except subprocess.CalledProcessError as e:
+                    error_msg = (
+                        f"SGE qsub array submission failed (tasks {task_spec}): "
+                        f"{e.output.strip()}\n  Command: {call}"
+                    )
+                    self.logger.error(error_msg)
+                    for job in sub_jobs:
+                        self._report_error_threadsafe(
+                            SubmittedJobInfo(job),
+                            f"Part of failed array qsub submission (tasks {task_spec}); see log.",
+                        )
+                    continue
+
+                sge_jobid = _parse_qsub_jobid(out)
+                if sge_jobid is None:
+                    self.logger.error(f"Could not parse SGE array job ID from: {out!r}")
+                    for job in sub_jobs:
+                        self._report_error_threadsafe(
+                            SubmittedJobInfo(job),
+                            f"Could not parse SGE job ID from qsub output: {out!r}",
+                        )
+                    continue
+
+                self._submitted_job_ids.append(sge_jobid)
+                hold_msg = ""
+                if hold_ad_id:
+                    hold_msg += f" -hold_jid_ad {hold_ad_id}"
+                if hold_ids:
+                    hold_msg += f" -hold_jid {','.join(hold_ids)}"
+                self.logger.info(
+                    f"Submitted SGE array job {sge_jobid} "
+                    f"for {kind} '{jobs[0].name}' "
+                    f"(tasks {task_spec}){hold_msg}."
+                )
+
+                # Record in _job_to_sge BEFORE notifying Snakemake so
+                # downstream hold resolution sees this sub-range's job ID.
+                for idx, job in zip(sub_idxs, sub_jobs):
+                    self._job_to_sge[job] = (sge_jobid, idx)
+
+                for idx, job in zip(sub_idxs, sub_jobs):
+                    external_id = f"{sge_jobid}.{idx}"
+                    log_o = first_job_logdir / f"{sge_jobid}.{idx}.log"
+                    log_e = first_job_logdir / f"{sge_jobid}.{idx}.error"
+                    self._report_submission_threadsafe(
+                        SubmittedJobInfo(
+                            job,
+                            external_jobid=external_id,
+                            aux={
+                                "log_stdout": log_o,
+                                "log_stderr": log_e,
+                                "submit_time": time.time(),
+                            },
+                        )
+                    )
 
     # ------------------------------------------------------------------
     # Status checking
