@@ -37,7 +37,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Generator, List, Optional
+from typing import Dict, Generator, List, Optional
 import re
 import shlex
 import subprocess
@@ -536,46 +536,66 @@ class Executor(RemoteExecutor):
         the upstream array job IDs to pass to plain -hold_jid (whole upstream
         array(s) must finish before any downstream task starts).
         """
-        # Collect each chunk task's upstreams.  Each entry is a list of
-        # (sge_jobid, task_idx) tuples; task_idx is None when the
-        # upstream was a single (non-array) submission.
+        # Collect per-task upstream info keyed by upstream RULE NAME, not by
+        # SGE job ID.  Using the rule name is essential when an upstream rule
+        # was submitted in multiple waves (each wave is a separate SGE array
+        # job with its own job ID).  Tasks in wave 1 and wave 2 both belong to
+        # the same logical rule; comparing SGE job IDs across tasks would make
+        # the whole chunk ineligible for -hold_jid_ad because task 1 only
+        # "sees" wave-1's SGE ID while task 500 only "sees" wave-2's.
+        #
+        # Entries are (rule_name, sge_jobid, task_idx) triples.
         per_task: List[List[tuple]] = []
-        all_base_ids: List[str] = []
+        all_rule_names: List[str] = []   # unique rule names — defines the set
+        all_base_ids: List[str] = []     # unique SGE job IDs for -hold_jid fallback
+        chunk_sge_ids: List[str] = []    # SGE IDs actually used in this chunk
+
         for j in chunk_jobs:
             entries: List[tuple] = []
-            for _, sge_jobid, task_idx in self._upstream_ext_ids(j):
-                entries.append((sge_jobid, task_idx))
+            for upstream_job, sge_jobid, task_idx in self._upstream_ext_ids(j):
+                rule_name = upstream_job.name
+                entries.append((rule_name, sge_jobid, task_idx))
+                if rule_name not in all_rule_names:
+                    all_rule_names.append(rule_name)
                 if sge_jobid not in all_base_ids:
                     all_base_ids.append(sge_jobid)
+                if sge_jobid not in chunk_sge_ids:
+                    chunk_sge_ids.append(sge_jobid)
             per_task.append(entries)
 
-        if not all_base_ids:
+        if not all_rule_names:
             return (None, [])
 
-        # -hold_jid_ad eligibility: for every downstream chunk task, each
-        # upstream must be an array job and its task index must equal the
-        # downstream task index.  Every upstream base ID must appear exactly
-        # once per downstream task (no missing or extra upstreams per task).
-        # SGE's -hold_jid_ad accepts a comma-separated list, so multiple
-        # upstream arrays that all satisfy the 1:1 contract are eligible.
-        all_base_set = set(all_base_ids)
+        # -hold_jid_ad eligibility: for every downstream chunk task N, each
+        # upstream RULE must contribute exactly one task whose global index
+        # equals N, and every rule must be represented.  Using rule names (not
+        # SGE job IDs) correctly handles multi-wave upstream submissions.
+        all_rule_set = set(all_rule_names)
         eligible = True
         for offset, entries in enumerate(per_task):
             expected_idx = chunk_start + offset
-            seen: set = set()
-            for sge_jobid, task_idx in entries:
+            seen_rules: Dict[str, str] = {}  # rule_name → sge_jobid
+            for rule_name, sge_jobid, task_idx in entries:
                 if task_idx is None or task_idx != expected_idx:
                     # Non-array upstream or mismatched index — can't use
                     # -hold_jid_ad.
                     eligible = False
                     break
-                seen.add(sge_jobid)
-            if not eligible or seen != all_base_set:
+                if rule_name in seen_rules:
+                    # Multiple upstream tasks from the same rule for one
+                    # downstream task — not a clean 1:1 mapping.
+                    eligible = False
+                    break
+                seen_rules[rule_name] = sge_jobid
+            if not eligible or set(seen_rules) != all_rule_set:
                 eligible = False
                 break
 
         if eligible:
-            hold_ad = ",".join(all_base_ids)
+            # Pass only the SGE job IDs actually present in this chunk so SGE
+            # does not attempt to resolve task N of an upstream wave whose
+            # task-ID range does not include N.
+            hold_ad = ",".join(chunk_sge_ids)
             self.logger.debug(
                 f"Array chunk eligible for -hold_jid_ad on {hold_ad}"
             )
