@@ -469,8 +469,12 @@ def get_submit_command(
     )
     if hold_jid:
         call += f" -hold_jid {_safe(str(hold_jid))}"
-    elif hold_jid_list and not hold_jid_ad_override:
-        # Auto-resolved dependencies from Snakemake DAG (--immediate-submit)
+    elif hold_jid_list:
+        # Auto-resolved dependencies from Snakemake DAG (--immediate-submit).
+        # Emitting -hold_jid alongside -hold_jid_ad is intentional when
+        # hold_jid_list contains non-array upstreams (task_idx=None) and
+        # hold_jid_ad_override contains array upstreams — they are disjoint
+        # sets so there is no redundancy.
         call += f" -hold_jid {','.join(hold_jid_list)}"
 
     hold_jid_ad = (

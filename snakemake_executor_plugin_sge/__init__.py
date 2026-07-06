@@ -364,21 +364,26 @@ class Executor(RemoteExecutor):
 
         # Authoritative mapping from a Snakemake job to its SGE submission.
         # Each entry is (sge_jobid, task_idx) where task_idx is None for
-        # non-array (single qsub) submissions or the 1-based array task
-        # index for array submissions.  Used to resolve cross-job
-        # dependencies under --immediate-submit without depending on
-        # Snakemake's persistence layer (which doesn't always have the
-        # external_jobid populated by the time downstream submissions
-        # need it).
+        # non-array (single qsub) submissions, or the global subject index
+        # for array submissions.  The global subject index is shared across
+        # all rules: jobs that process the same wildcard combination always
+        # get the same index, so -hold_jid_ad aligns downstream task N with
+        # the correct upstream task N regardless of which rule or wave the
+        # upstream was submitted in.
         self._job_to_sge: "dict[JobExecutorInterface, tuple]" = {}
 
-        # Per-rule wave tracking: each run_array_job() call for a given rule is
-        # a new "wave".  Task IDs continue globally across waves (wave 2 picks
-        # up where wave 1 ended) so that -hold_jid_ad alignment is preserved
-        # for per-subject downstream parallelism.  A separate task_map file per
-        # wave avoids key collisions between waves of the same rule.
-        self._rule_wave_num: "dict[str, int]" = {}   # wave counter per rule (for file naming)
-        self._rule_task_end: "dict[str, int]" = {}   # global task-end per rule (for 1:1 holds)
+        # Global subject index registry.  Assigns a unique, stable integer
+        # index to each distinct wildcard combination seen across all rules.
+        # This index is used as the SGE array task ID so that SGE's
+        # -hold_jid_ad can align tasks purely by subject identity.
+        self._subject_to_idx: Dict[str, int] = {}
+        self._next_subject_idx: int = 0
+
+        # Per-rule chunk counter used only for unique file naming.
+        # (Replaces the old _rule_wave_num / _rule_task_end pair, which also
+        # drove task-ID sequencing — that role is now handled by the global
+        # subject index above.)
+        self._rule_chunk_num: "dict[str, int]" = {}
 
         atexit.register(self.clean_old_logs)
 
@@ -514,94 +519,84 @@ class Executor(RemoteExecutor):
                 f"will be applied to every task."
             )
 
+    def _wildcard_key(self, job) -> str:
+        """Canonical string key for the subject represented by *job*.
+
+        Two jobs from different rules processing the same wildcard combination
+        return the same key, so they get the same global subject index and
+        therefore the same SGE task ID — a prerequisite for -hold_jid_ad.
+        """
+        wc = getattr(job, "wildcards", None)
+        if not wc:
+            return f"__jobid_{getattr(job, 'jobid', id(job))}"
+        return "|".join(f"{k}={v}" for k, v in sorted(wc.items()))
+
+    def _get_or_assign_subject_idx(self, job) -> int:
+        """Return the global subject index for *job*, assigning one if new."""
+        key = self._wildcard_key(job)
+        if key not in self._subject_to_idx:
+            self._next_subject_idx += 1
+            self._subject_to_idx[key] = self._next_subject_idx
+        return self._subject_to_idx[key]
+
+    @staticmethod
+    def _ids_to_sge_task_spec(ids: List[int]) -> str:
+        """Convert a list of task IDs to a compact SGE -t range spec.
+
+        Consecutive IDs are collapsed into ranges.
+        E.g. [1, 2, 3, 7, 8, 42] → '1-3,7-8,42'.
+        SGE/UGE support comma-separated ranges in the -t flag.
+        """
+        sorted_ids = sorted(set(ids))
+        if not sorted_ids:
+            return "1-1"
+        ranges: List[str] = []
+        start = end = sorted_ids[0]
+        for i in sorted_ids[1:]:
+            if i == end + 1:
+                end = i
+            else:
+                ranges.append(str(start) if start == end else f"{start}-{end}")
+                start = end = i
+        ranges.append(str(start) if start == end else f"{start}-{end}")
+        return ",".join(ranges)
+
     def _resolve_array_holds(
         self,
         chunk_jobs: List[JobExecutorInterface],
-        chunk_start: int,
     ):
-        """Decide whether to hold this array chunk with -hold_jid_ad or -hold_jid.
+        """Resolve upstream SGE dependencies for an array chunk.
+
+        Because every job uses a global subject index as its SGE task ID,
+        downstream task N always corresponds to the same subject as upstream
+        task N across every rule.  -hold_jid_ad is therefore always correct
+        for array upstreams: if the upstream task doesn't exist for a subject
+        (its outputs were already produced in a previous run), SGE releases
+        the downstream task automatically.
+
+        Non-array upstreams (single qsub calls, task_idx=None) still require
+        a whole-job -hold_jid because they carry no per-task index.
 
         Returns
         -------
         (hold_jid_ad, hold_jid_list)
-
-        ``hold_jid_ad`` is a comma-separated string of upstream array job IDs
-        when every downstream task N maps exactly to task N of every upstream
-        array.  SGE accepts a comma-separated list for -hold_jid_ad, so
-        multiple upstream arrays (e.g. recon-all AND thalamic_seg both feeding
-        tracula) are handled correctly — each tracula task N starts the moment
-        its specific recon-all task N AND thalamic_seg task N both finish.
-
-        Otherwise ``hold_jid_ad`` is None and ``hold_jid_list`` carries all
-        the upstream array job IDs to pass to plain -hold_jid (whole upstream
-        array(s) must finish before any downstream task starts).
         """
-        # Collect per-task upstream info keyed by upstream RULE NAME, not by
-        # SGE job ID.  Using the rule name is essential when an upstream rule
-        # was submitted in multiple waves (each wave is a separate SGE array
-        # job with its own job ID).  Tasks in wave 1 and wave 2 both belong to
-        # the same logical rule; comparing SGE job IDs across tasks would make
-        # the whole chunk ineligible for -hold_jid_ad because task 1 only
-        # "sees" wave-1's SGE ID while task 500 only "sees" wave-2's.
-        #
-        # Entries are (rule_name, sge_jobid, task_idx) triples.
-        per_task: List[List[tuple]] = []
-        all_rule_names: List[str] = []   # unique rule names — defines the set
-        all_base_ids: List[str] = []     # unique SGE job IDs for -hold_jid fallback
-        chunk_sge_ids: List[str] = []    # SGE IDs actually used in this chunk
+        hold_jid_ad_ids: List[str] = []  # array upstreams  → -hold_jid_ad
+        hold_jid_ids: List[str] = []     # non-array upstreams → -hold_jid
 
         for j in chunk_jobs:
-            entries: List[tuple] = []
-            for upstream_job, sge_jobid, task_idx in self._upstream_ext_ids(j):
-                rule_name = upstream_job.name
-                entries.append((rule_name, sge_jobid, task_idx))
-                if rule_name not in all_rule_names:
-                    all_rule_names.append(rule_name)
-                if sge_jobid not in all_base_ids:
-                    all_base_ids.append(sge_jobid)
-                if sge_jobid not in chunk_sge_ids:
-                    chunk_sge_ids.append(sge_jobid)
-            per_task.append(entries)
+            for _, sge_jobid, task_idx in self._upstream_ext_ids(j):
+                if task_idx is None:
+                    if sge_jobid not in hold_jid_ids:
+                        hold_jid_ids.append(sge_jobid)
+                else:
+                    if sge_jobid not in hold_jid_ad_ids:
+                        hold_jid_ad_ids.append(sge_jobid)
 
-        if not all_rule_names:
-            return (None, [])
-
-        # -hold_jid_ad eligibility: for every downstream chunk task N, each
-        # upstream RULE must contribute exactly one task whose global index
-        # equals N, and every rule must be represented.  Using rule names (not
-        # SGE job IDs) correctly handles multi-wave upstream submissions.
-        all_rule_set = set(all_rule_names)
-        eligible = True
-        for offset, entries in enumerate(per_task):
-            expected_idx = chunk_start + offset
-            seen_rules: Dict[str, str] = {}  # rule_name → sge_jobid
-            for rule_name, sge_jobid, task_idx in entries:
-                if task_idx is None or task_idx != expected_idx:
-                    # Non-array upstream or mismatched index — can't use
-                    # -hold_jid_ad.
-                    eligible = False
-                    break
-                if rule_name in seen_rules:
-                    # Multiple upstream tasks from the same rule for one
-                    # downstream task — not a clean 1:1 mapping.
-                    eligible = False
-                    break
-                seen_rules[rule_name] = sge_jobid
-            if not eligible or set(seen_rules) != all_rule_set:
-                eligible = False
-                break
-
-        if eligible:
-            # Pass only the SGE job IDs actually present in this chunk so SGE
-            # does not attempt to resolve task N of an upstream wave whose
-            # task-ID range does not include N.
-            hold_ad = ",".join(chunk_sge_ids)
-            self.logger.debug(
-                f"Array chunk eligible for -hold_jid_ad on {hold_ad}"
-            )
-            return (hold_ad, [])
-
-        return (None, all_base_ids)
+        hold_ad = ",".join(hold_jid_ad_ids) if hold_jid_ad_ids else None
+        if hold_ad:
+            self.logger.debug(f"Array chunk using -hold_jid_ad on {hold_ad}")
+        return (hold_ad, hold_jid_ids)
 
     def _upstream_ext_ids(self, job):
         """Yield ``(upstream_job, sge_jobid, task_idx)`` for each upstream.
@@ -762,20 +757,22 @@ class Executor(RemoteExecutor):
     # ------------------------------------------------------------------
 
     def run_array_job(self, jobs: List[JobExecutorInterface]) -> None:
-        """Submit all tasks in *jobs* as a single SGE array job.
+        """Submit all tasks in *jobs* as one or more SGE array jobs.
 
-        Each task is encoded as a zlib-compressed, base64-encoded JSON
-        entry so that the submission script can unpack and execute it
-        based on ``$SGE_TASK_ID``.
+        Each task is encoded as a zlib-compressed, base64-encoded JSON entry
+        so that the submission script can unpack and execute it based on
+        ``$SGE_TASK_ID``.
 
-        The approach is identical to the SLURM plugin's ``run_array_jobs``
-        method, adapted for SGE's ``qsub -t <start>-<end>`` syntax.
+        Task IDs are GLOBAL SUBJECT INDICES shared across all rules: the same
+        wildcard combination always gets the same integer index regardless of
+        which rule submits it.  This means downstream task N and upstream task
+        N always refer to the same subject, so SGE's -hold_jid_ad gives exact
+        per-subject dependency tracking with no eligibility check needed.
 
-        Both group jobs and same-rule regular-job buckets are supported.
-        All tasks in a single submission share one set of SGE resources
-        (queue, memory, runtime, etc.) taken from the first job in the
-        bucket -- callers should bucket jobs whose resources are
-        compatible (e.g. all instances of the same rule).
+        When a subject's upstream outputs already exist from a previous run,
+        that subject is not resubmitted for the upstream rule.  Its task ID
+        therefore does not exist in the upstream SGE array, and SGE releases
+        the downstream task automatically — no stale hold.
         """
         if not jobs:
             return
@@ -786,89 +783,64 @@ class Executor(RemoteExecutor):
             else f"rule_{jobs[0].name}"
         )
 
-        # Array jobs share one -o/-e path across all tasks, so per-task workdir
-        # paths are not usable.  Always use the main workflow log directory so
-        # logs from different subjects don't pile up in the first subject's folder.
         first_job_logdir = self.sge_logdir_default
         first_job_logdir.mkdir(parents=True, exist_ok=True)
 
-        # Helper files (manifests, scripts, task maps) are stored in .meta subdirectory
         meta_dir = first_job_logdir / ".meta" / group_or_rule
         meta_dir.mkdir(parents=True, exist_ok=True)
 
-        # Each run_array_job() call is a new "wave" for this rule.  Task IDs
-        # continue from where the previous wave of the same rule ended so that
-        # downstream rules can always use -hold_jid_ad for per-subject
-        # parallelism: SGE aligns task N of the downstream with task N of the
-        # upstream, and that mapping is only valid when every rule uses a single
-        # consistent global numbering scheme.  A per-wave task_map file avoids
-        # key collisions between waves — each submission script is baked with
-        # the path to its own wave's file.
-        rule_key = group_or_rule
-        wave_num = self._rule_wave_num.get(rule_key, 0) + 1
-        self._rule_wave_num[rule_key] = wave_num
-        n_tasks = len(jobs)
+        # Assign each job its global subject index.  The same wildcard
+        # combination always maps to the same index across all rules, so
+        # -hold_jid_ad can align tasks purely by subject identity.
+        subject_idxs = [self._get_or_assign_subject_idx(j) for j in jobs]
 
-        # Assign globally-continuing task IDs across successive waves of the
-        # same rule.  This is critical for -hold_jid_ad (per-task hold): SGE
-        # makes downstream task N wait only for upstream task N, so both sides
-        # must use the same numbering scheme.  Restarting at 1 each wave breaks
-        # that alignment when multiple upstream waves exist, causing the executor
-        # to fall back to -hold_jid (whole-array hold), defeating subject-level
-        # parallelism.
-        wave_start = self._rule_task_end.get(rule_key, 0) + 1
-        wave_end = wave_start + n_tasks - 1
-        self._rule_task_end[rule_key] = wave_end
-
-        # Build the compressed task → command map keyed by global task IDs.
-        # SGE_TASK_ID will be in [wave_start, wave_end] for this array.
+        # Build the compressed task → command map keyed by global subject index.
+        # All chunks of this call share one map file so submission scripts
+        # look up by $SGE_TASK_ID directly.
         task_map = {
             str(idx): base64.b64encode(
                 zlib.compress(self.format_job_exec(job).encode("utf-8"), level=9)
             ).decode()
-            for idx, job in enumerate(jobs, start=wave_start)
+            for idx, job in zip(subject_idxs, jobs)
         }
-        task_map_b64 = base64.b64encode(
-            json.dumps(task_map).encode()
-        ).decode()
+        task_map_b64 = base64.b64encode(json.dumps(task_map).encode()).decode()
 
-        # Manifest: human-readable record of task ID → wildcards for debugging.
+        # Chunk counter used only for unique file naming.
+        rule_key = group_or_rule
+        chunk_num = self._rule_chunk_num.get(rule_key, 0) + 1
+        self._rule_chunk_num[rule_key] = chunk_num
+
+        task_map_file = meta_dir / f"task_map_chunk{chunk_num}.b64"
+        task_map_file.write_text(task_map_b64)
+
+        # Human-readable manifest for debugging: global index → wildcards.
         manifest = {
             str(idx): {
                 "snakemake_jobid": getattr(job, "jobid", None),
                 "wildcards": dict(job.wildcards) if getattr(job, "wildcards", None) else {},
                 "is_group": job.is_group(),
             }
-            for idx, job in enumerate(jobs, start=wave_start)
+            for idx, job in zip(subject_idxs, jobs)
         }
-        manifest_path = meta_dir / f"task_manifest_wave{wave_num}.json"
+        manifest_path = meta_dir / f"task_manifest_chunk{chunk_num}.json"
         try:
             manifest_path.write_text(json.dumps(manifest, indent=2))
         except OSError as exc:
             self.logger.debug(f"Could not write task manifest {manifest_path}: {exc}")
 
-        # SGE arrays share one resource spec across all tasks.  When the
-        # bucket contains jobs whose resources differ (e.g. per-wildcard
-        # mem_mb / runtime), the first job's values are applied to every
-        # task.  Warn so users notice silent over/under-allocation.
         self._warn_on_heterogeneous_resources(jobs)
 
         settings = self.workflow.executor_settings
         array_limit = settings.array_limit
+        kind = "group" if jobs[0].is_group() else "rule"
+        workdir = str(self.workflow.workdir_init)
 
-        # Write this wave's task map.  Named per wave so concurrent or
-        # successive waves of the same rule don't overwrite each other.
-        task_map_file = meta_dir / f"task_map_wave{wave_num}.b64"
-        task_map_file.write_text(task_map_b64)
+        # Submit in chunks of at most array_limit tasks each.
+        for sub_chunk, chunk_offset in enumerate(range(0, len(jobs), array_limit), start=1):
+            chunk_jobs = jobs[chunk_offset:chunk_offset + array_limit]
+            chunk_idxs = subject_idxs[chunk_offset:chunk_offset + array_limit]
+            task_spec = self._ids_to_sge_task_spec(chunk_idxs)
 
-        for chunk_start in range(wave_start, wave_end + 1, array_limit):
-            chunk_end = min(chunk_start + array_limit - 1, wave_end)
-            # Convert global task indices to 0-based slice indices into jobs.
-            local_start = chunk_start - wave_start
-            local_end = local_start + (chunk_end - chunk_start + 1)
-            chunk_jobs = jobs[local_start:local_end]
-
-            kind = "group" if jobs[0].is_group() else "rule"
             script_lines = [
                 "#!/bin/bash",
                 "set -euo pipefail",
@@ -879,7 +851,8 @@ class Executor(RemoteExecutor):
                 "# Avoids ARG_MAX issues for large arrays (150+ tasks).",
                 f"export TASK_MAP_FILE={shlex.quote(str(task_map_file))}",
                 "",
-                "# Decode the exec command for this task from the task map file.",
+                "# Decode the exec command for this task from the task map.",
+                "# $SGE_TASK_ID is the global subject index for this task.",
                 "export _tid=${SGE_TASK_ID}",
                 "_cmd=$(",
                 "  python3 - <<'PYEOF'",
@@ -894,46 +867,25 @@ class Executor(RemoteExecutor):
                 "eval \"$_cmd\"",
             ]
 
-            script_content = "\n".join(script_lines)
-
-            script_path = meta_dir / f"array_job_{chunk_start}_{chunk_end}.sh"
-            script_path.write_text(script_content)
+            script_path = meta_dir / f"array_job_chunk{chunk_num}_{sub_chunk}.sh"
+            script_path.write_text("\n".join(script_lines))
             script_path.chmod(0o755)
-
-            # Use the main workflow workdir for the qsub -wd flag.  Individual
-            # task commands in the task map already carry full absolute paths, so
-            # the array-level working directory only needs to be a valid directory.
-            workdir = str(self.workflow.workdir_init)
 
             job_params = {
                 "run_uuid": self.run_uuid,
                 "log_stdout": first_job_logdir / "$JOB_ID.$TASK_ID.log",
                 "log_stderr": first_job_logdir / "$JOB_ID.$TASK_ID.error",
                 "workdir": workdir,
-                "array_range": f"{chunk_start}-{chunk_end}",
+                "array_range": task_spec,
             }
 
-            # Resolve cross-array dependencies.  Two cases:
-            #
-            #   1. Per-task 1:1 matching across a single upstream array
-            #      (e.g. run_bamos_correction[N] -> run_bamos[N], one
-            #      subject per task).  → use SGE's -hold_jid_ad so a
-            #      downstream task starts the moment its specific
-            #      upstream task finishes, instead of waiting for the
-            #      whole upstream array.
-            #
-            #   2. Anything else (multiple upstream arrays, or task
-            #      indices that don't line up).  → fall back to
-            #      -hold_jid (whole-array hold).
-            hold_ad_id, hold_ids = self._resolve_array_holds(
-                chunk_jobs, chunk_start
-            )
+            hold_ad_id, hold_ids = self._resolve_array_holds(chunk_jobs)
 
             call = get_submit_command(
                 chunk_jobs[0],
                 job_params,
                 settings=settings,
-                exec_cmd=None,  # command is in script
+                exec_cmd=None,
                 script_path=str(script_path),
                 is_array=True,
                 hold_jid_list=hold_ids,
@@ -951,24 +903,20 @@ class Executor(RemoteExecutor):
                 self.logger.info(out)
             except subprocess.CalledProcessError as e:
                 error_msg = (
-                    f"SGE qsub array submission failed "
-                    f"(tasks {chunk_start}-{chunk_end}): "
+                    f"SGE qsub array submission failed (tasks {task_spec}): "
                     f"{e.output.strip()}\n  Command: {call}"
                 )
                 self.logger.error(error_msg)
                 for job in chunk_jobs:
                     self._report_error_threadsafe(
                         SubmittedJobInfo(job),
-                        f"Part of failed array qsub submission "
-                        f"(tasks {chunk_start}-{chunk_end}); see log.",
+                        f"Part of failed array qsub submission (tasks {task_spec}); see log.",
                     )
                 continue
 
             sge_jobid = _parse_qsub_jobid(out)
             if sge_jobid is None:
-                self.logger.error(
-                    f"Could not parse SGE array job ID from: {out!r}"
-                )
+                self.logger.error(f"Could not parse SGE array job ID from: {out!r}")
                 for job in chunk_jobs:
                     self._report_error_threadsafe(
                         SubmittedJobInfo(job),
@@ -979,28 +927,24 @@ class Executor(RemoteExecutor):
             self._submitted_job_ids.append(sge_jobid)
             hold_msg = ""
             if hold_ad_id:
-                hold_msg = f" -hold_jid_ad {hold_ad_id}"
-            elif hold_ids:
-                hold_msg = f" -hold_jid {','.join(hold_ids)}"
+                hold_msg += f" -hold_jid_ad {hold_ad_id}"
+            if hold_ids:
+                hold_msg += f" -hold_jid {','.join(hold_ids)}"
             self.logger.info(
                 f"Submitted SGE array job {sge_jobid} "
                 f"for {kind} '{jobs[0].name}' "
-                f"(tasks {chunk_start}-{chunk_end}){hold_msg}."
+                f"(tasks {task_spec}){hold_msg}."
             )
 
-            # Record the job→SGE-id mapping for the whole chunk BEFORE
-            # notifying Snakemake.  Each report_job_submission may unblock
-            # the scheduler, which can immediately call run_jobs again
-            # with downstream tasks that need to read these mappings.
-            for task_idx, job in enumerate(chunk_jobs, start=chunk_start):
-                self._job_to_sge[job] = (sge_jobid, task_idx)
+            # Record global subject index in _job_to_sge BEFORE notifying
+            # Snakemake so downstream submissions see the mapping immediately.
+            for idx, job in zip(chunk_idxs, chunk_jobs):
+                self._job_to_sge[job] = (sge_jobid, idx)
 
-            # Register each task with Snakemake
-            for task_idx, job in enumerate(chunk_jobs, start=chunk_start):
-                external_id = f"{sge_jobid}.{task_idx}"
-                # Each job in the array may have its own logdir; use the first job's for the array
-                log_o = first_job_logdir / f"{sge_jobid}.{task_idx}.log"
-                log_e = first_job_logdir / f"{sge_jobid}.{task_idx}.error"
+            for idx, job in zip(chunk_idxs, chunk_jobs):
+                external_id = f"{sge_jobid}.{idx}"
+                log_o = first_job_logdir / f"{sge_jobid}.{idx}.log"
+                log_e = first_job_logdir / f"{sge_jobid}.{idx}.error"
                 self._report_submission_threadsafe(
                     SubmittedJobInfo(
                         job,
