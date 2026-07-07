@@ -582,13 +582,24 @@ class Executor(RemoteExecutor):
 
         Because every job uses a global subject index as its SGE task ID,
         downstream task N always corresponds to the same subject as upstream
-        task N across every rule.  -hold_jid_ad is therefore always correct
-        for array upstreams: if the upstream task doesn't exist for a subject
-        (its outputs were already produced in a previous run), SGE releases
-        the downstream task automatically.
+        task N across every rule.  -hold_jid_ad is therefore correct when a
+        single upstream array job covers this sub-range — UCL SGE requires
+        exact task-range alignment for -hold_jid_ad.
 
-        Non-array upstreams (single qsub calls, task_idx=None) still require
-        a whole-job -hold_jid because they carry no per-task index.
+        When the upstream was split into multiple sub-range jobs (v0.6.20+),
+        consecutive downstream tasks may map to different upstream job IDs.
+        The submission loop uses _split_by_upstream_boundaries() to pre-split
+        downstream sub-ranges at those boundaries, so in the common case each
+        downstream sub-range sees exactly one upstream job ID here.
+
+        If multiple upstream array job IDs still appear (e.g. the downstream
+        task depends on two different upstream rules whose sub-range boundaries
+        don't align), UCL SGE would reject comma-separated -hold_jid_ad IDs
+        with a range-mismatch error.  Fall back to whole-job -hold_jid in that
+        case — it's less granular but always safe.
+
+        Non-array upstreams (single qsub calls, task_idx=None) always use
+        whole-job -hold_jid because they carry no per-task index.
 
         Returns
         -------
@@ -606,10 +617,63 @@ class Executor(RemoteExecutor):
                     if sge_jobid not in hold_jid_ad_ids:
                         hold_jid_ad_ids.append(sge_jobid)
 
-        hold_ad = ",".join(hold_jid_ad_ids) if hold_jid_ad_ids else None
-        if hold_ad:
+        if len(hold_jid_ad_ids) == 1:
+            hold_ad = hold_jid_ad_ids[0]
             self.logger.debug(f"Array chunk using -hold_jid_ad on {hold_ad}")
+        elif len(hold_jid_ad_ids) > 1:
+            # Multiple upstream sub-range job IDs — UCL SGE rejects
+            # comma-separated -hold_jid_ad when task ranges differ.
+            # Promote all to whole-job -hold_jid which is always safe.
+            self.logger.debug(
+                f"Array chunk: multiple upstream array jobs "
+                f"({hold_jid_ad_ids}); using -hold_jid instead of -hold_jid_ad"
+            )
+            for jid in hold_jid_ad_ids:
+                if jid not in hold_jid_ids:
+                    hold_jid_ids.append(jid)
+            hold_ad = None
+        else:
+            hold_ad = None
+
         return (hold_ad, hold_jid_ids)
+
+    def _split_by_upstream_boundaries(
+        self,
+        contiguous_ranges: List[Tuple[int, int, List[int]]],
+        idx_to_job: Dict[int, JobExecutorInterface],
+    ) -> List[Tuple[int, int, List[int]]]:
+        """Further split contiguous sub-ranges at upstream SGE job boundaries.
+
+        UCL SGE requires that -hold_jid_ad's downstream task range exactly
+        matches the upstream job's task range.  When the upstream was itself
+        split into multiple sub-range jobs (by _split_contiguous_ranges), tasks
+        within an otherwise-contiguous downstream sub-range may belong to
+        different upstream array jobs.  Splitting here ensures each resulting
+        downstream sub-range sees at most one upstream array job ID per rule,
+        enabling -hold_jid_ad alignment.
+        """
+        result: List[Tuple[int, int, List[int]]] = []
+        for (_, _, idxs) in contiguous_ranges:
+            current_key: Optional[frozenset] = None
+            current_run: List[int] = []
+            for idx in idxs:
+                job = idx_to_job[idx]
+                # Key = frozenset of upstream array SGE job IDs for this task.
+                key = frozenset(
+                    sge_jobid
+                    for _, sge_jobid, task_idx in self._upstream_ext_ids(job)
+                    if task_idx is not None
+                )
+                if key != current_key:
+                    if current_run:
+                        result.append((current_run[0], current_run[-1], current_run))
+                    current_key = key
+                    current_run = [idx]
+                else:
+                    current_run.append(idx)
+            if current_run:
+                result.append((current_run[0], current_run[-1], current_run))
+        return result
 
     def _upstream_ext_ids(self, job):
         """Yield ``(upstream_job, sge_jobid, task_idx)`` for each upstream.
@@ -860,7 +924,11 @@ class Executor(RemoteExecutor):
             chunk_idxs = subject_idxs[chunk_offset:chunk_offset + array_limit]
 
             idx_to_job = dict(zip(chunk_idxs, chunk_jobs))
-            sub_ranges = self._split_contiguous_ranges(chunk_idxs)
+            # First split into contiguous runs, then further split at upstream
+            # SGE job ID boundaries so each sub-range sees at most one upstream
+            # array job — a prerequisite for -hold_jid_ad range alignment.
+            contiguous = self._split_contiguous_ranges(chunk_idxs)
+            sub_ranges = self._split_by_upstream_boundaries(contiguous, idx_to_job)
 
             for sub_range_num, (sub_start, sub_end, sub_idxs) in enumerate(sub_ranges, start=1):
                 sub_jobs = [idx_to_job[i] for i in sub_idxs]
