@@ -254,9 +254,11 @@ def get_submit_command(
         Auto-resolved whole-array upstream job IDs (passed via -hold_jid).
         Used when downstream tasks must wait for entire upstream arrays.
     hold_jid_ad_override:
-        Single upstream array job ID passed via -hold_jid_ad. When set,
-        task N of this array waits only on task N of the upstream array.
-        Takes precedence over settings.hold_jid_ad.
+        Upstream array job ID(s) passed via -hold_jid_ad. When set, task N of
+        this array waits only on task N of each upstream array.  May be a single
+        job ID or a comma-separated list of several upstream array job IDs — SGE
+        accepts the list as long as every listed job shares this array's exact
+        -t range.  Takes precedence over settings.hold_jid_ad.
     """
     log_dir   = Path(params.get("log_dir") or str(params.get("log_stdout", "")).rsplit("/", 1)[0])
     run_uuid  = params.get("run_uuid", "0000")

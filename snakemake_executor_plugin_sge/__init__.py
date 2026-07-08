@@ -372,6 +372,16 @@ class Executor(RemoteExecutor):
         # upstream was submitted in.
         self._job_to_sge: "dict[JobExecutorInterface, tuple]" = {}
 
+        # Maps each submitted array SGE job ID to the exact (start, end) task
+        # range it was submitted with (its -t range).  UCL SGE accepts
+        # -hold_jid_ad (including a comma-separated list of several upstream
+        # array jobs) only when EVERY listed upstream job shares the exact same
+        # -t range as the dependent downstream array.  We record each array's
+        # range here so hold resolution can tell which upstream arrays are
+        # range-compatible (eligible for per-task -hold_jid_ad) and which are
+        # not (must fall back to whole-job -hold_jid).
+        self._array_job_range: Dict[str, Tuple[int, int]] = {}
+
         # Global subject index registry.  Assigns a unique, stable integer
         # index to each distinct wildcard combination seen across all rules.
         # This index is used as the SGE array task ID so that SGE's
@@ -577,63 +587,77 @@ class Executor(RemoteExecutor):
     def _resolve_array_holds(
         self,
         chunk_jobs: List[JobExecutorInterface],
+        down_start: int,
+        down_end: int,
     ):
-        """Resolve upstream SGE dependencies for an array chunk.
+        """Resolve upstream SGE dependencies for a downstream array sub-range.
 
         Because every job uses a global subject index as its SGE task ID,
         downstream task N always corresponds to the same subject as upstream
-        task N across every rule.  -hold_jid_ad is therefore correct when a
-        single upstream array job covers this sub-range — UCL SGE requires
-        exact task-range alignment for -hold_jid_ad.
+        task N across every rule.  Per-task -hold_jid_ad therefore expresses
+        exactly the dependency we want: downstream task N waits only on
+        upstream task N.
 
-        When the upstream was split into multiple sub-range jobs (v0.6.20+),
-        consecutive downstream tasks may map to different upstream job IDs.
-        The submission loop uses _split_by_upstream_boundaries() to pre-split
-        downstream sub-ranges at those boundaries, so in the common case each
-        downstream sub-range sees exactly one upstream job ID here.
+        The one constraint UCL SGE imposes (verified empirically) is a range
+        one, not a count one: an upstream array named in -hold_jid_ad must have
+        the *exact same* -t range as the dependent downstream array.  A subset
+        range is rejected ("This array job must have the same range of
+        sub-tasks as the dependent array job specified with -hold_jid_ad"), and
+        this applies even to a single upstream.  Crucially, a comma-separated
+        list of several upstream arrays IS accepted, provided every one of them
+        shares that identical range — so a downstream that depends on multiple
+        upstream rules (e.g. metrics ← dtifit + noddi + tract_qc) can still get
+        full per-task holds when all those rules were submitted over the same
+        range (the common case for a fresh run, where every rule is -t 1-N).
 
-        If multiple upstream array job IDs still appear (e.g. the downstream
-        task depends on two different upstream rules whose sub-range boundaries
-        don't align), UCL SGE would reject comma-separated -hold_jid_ad IDs
-        with a range-mismatch error.  Fall back to whole-job -hold_jid in that
-        case — it's less granular but always safe.
-
-        Non-array upstreams (single qsub calls, task_idx=None) always use
-        whole-job -hold_jid because they carry no per-task index.
+        We therefore partition upstreams into:
+          * range-compatible array upstreams (their recorded -t range equals
+            this downstream sub-range) → joined into one comma-separated
+            -hold_jid_ad, preserving per-task granularity; and
+          * everything else — non-array upstreams (task_idx is None, no per-task
+            index) and range-incompatible array upstreams (an upstream whose
+            own -t range differs, which SGE would reject for -hold_jid_ad) →
+            whole-job -hold_jid, which is coarser but always valid.
 
         Returns
         -------
         (hold_jid_ad, hold_jid_list)
+            hold_jid_ad is a comma-separated string of range-compatible upstream
+            array job IDs (or None), and hold_jid_list is the list of job IDs
+            that must be held at whole-job granularity.
         """
-        hold_jid_ad_ids: List[str] = []  # array upstreams  → -hold_jid_ad
-        hold_jid_ids: List[str] = []     # non-array upstreams → -hold_jid
+        down_range = (down_start, down_end)
+        hold_jid_ad_ids: List[str] = []  # range-matching array upstreams
+        hold_jid_ids: List[str] = []     # non-array + range-mismatched arrays
 
         for j in chunk_jobs:
             for _, sge_jobid, task_idx in self._upstream_ext_ids(j):
                 if task_idx is None:
+                    # Non-array upstream: no per-task index, whole-job hold only.
                     if sge_jobid not in hold_jid_ids:
                         hold_jid_ids.append(sge_jobid)
-                else:
+                elif self._array_job_range.get(sge_jobid) == down_range:
+                    # Array upstream submitted over this exact range: eligible
+                    # for per-task -hold_jid_ad alongside any other matches.
                     if sge_jobid not in hold_jid_ad_ids:
                         hold_jid_ad_ids.append(sge_jobid)
+                else:
+                    # Array upstream over a different range: SGE would reject
+                    # -hold_jid_ad, so hold the whole upstream job instead.
+                    if sge_jobid not in hold_jid_ids:
+                        hold_jid_ids.append(sge_jobid)
 
-        if len(hold_jid_ad_ids) == 1:
-            hold_ad = hold_jid_ad_ids[0]
-            self.logger.debug(f"Array chunk using -hold_jid_ad on {hold_ad}")
-        elif len(hold_jid_ad_ids) > 1:
-            # Multiple upstream sub-range job IDs — UCL SGE rejects
-            # comma-separated -hold_jid_ad when task ranges differ.
-            # Promote all to whole-job -hold_jid which is always safe.
+        hold_ad = ",".join(hold_jid_ad_ids) if hold_jid_ad_ids else None
+        if hold_ad:
             self.logger.debug(
-                f"Array chunk: multiple upstream array jobs "
-                f"({hold_jid_ad_ids}); using -hold_jid instead of -hold_jid_ad"
+                f"Array sub-range {down_start}-{down_end} using "
+                f"-hold_jid_ad on {hold_ad}"
             )
-            for jid in hold_jid_ad_ids:
-                if jid not in hold_jid_ids:
-                    hold_jid_ids.append(jid)
-            hold_ad = None
-        else:
-            hold_ad = None
+        if hold_jid_ids:
+            self.logger.debug(
+                f"Array sub-range {down_start}-{down_end} using "
+                f"-hold_jid on {hold_jid_ids}"
+            )
 
         return (hold_ad, hold_jid_ids)
 
@@ -984,7 +1008,9 @@ class Executor(RemoteExecutor):
                 # may have been submitted in a different upstream sub-range
                 # job, so _resolve_array_holds returns the exact SGE job IDs
                 # that cover the subjects in this sub-range.
-                hold_ad_id, hold_ids = self._resolve_array_holds(sub_jobs)
+                hold_ad_id, hold_ids = self._resolve_array_holds(
+                    sub_jobs, sub_start, sub_end
+                )
 
                 call = get_submit_command(
                     sub_jobs[0],
@@ -1030,6 +1056,10 @@ class Executor(RemoteExecutor):
                     continue
 
                 self._submitted_job_ids.append(sge_jobid)
+                # Record this array's exact -t range so downstream rules can
+                # tell whether they may hold on it per-task (-hold_jid_ad,
+                # which requires an identical range) or only whole-job.
+                self._array_job_range[sge_jobid] = (sub_start, sub_end)
                 hold_msg = ""
                 if hold_ad_id:
                     hold_msg += f" -hold_jid_ad {hold_ad_id}"

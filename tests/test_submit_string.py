@@ -220,6 +220,33 @@ def test_hold_jid():
     cmd = get_submit_command(FakeJob(), PARAMS, s, "/s.sh", "1-1")
     assert "-hold_jid 9999" in cmd
 
+def test_hold_jid_ad_single():
+    cmd = get_submit_command(
+        FakeJob(), PARAMS, FakeSettings(), None, "/s.sh",
+        is_array=True, hold_jid_ad_override="12345",
+    )
+    assert "-hold_jid_ad 12345" in cmd
+
+def test_hold_jid_ad_comma_separated():
+    # Several range-compatible upstream arrays are held per-task via a single
+    # comma-separated -hold_jid_ad list (SGE accepts this when ranges match).
+    cmd = get_submit_command(
+        FakeJob(), PARAMS, FakeSettings(), None, "/s.sh",
+        is_array=True, hold_jid_ad_override="100,101,102",
+    )
+    assert "-hold_jid_ad 100,101,102" in cmd
+
+def test_hold_jid_ad_and_hold_jid_coexist():
+    # Range-compatible upstreams go to -hold_jid_ad; range-incompatible or
+    # non-array upstreams go to -hold_jid; both may appear together.
+    cmd = get_submit_command(
+        FakeJob(), PARAMS, FakeSettings(), None, "/s.sh",
+        is_array=True, hold_jid_list=["200", "201"],
+        hold_jid_ad_override="100,101",
+    )
+    assert "-hold_jid_ad 100,101" in cmd
+    assert "-hold_jid 200,201" in cmd
+
 def test_task_concurrency():
     s = FakeSettings(); s.task_concurrency = 10
     cmd = get_submit_command(FakeJob(), PARAMS, s, "/s.sh", "1-1")
