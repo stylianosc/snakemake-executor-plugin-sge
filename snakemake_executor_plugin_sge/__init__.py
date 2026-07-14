@@ -1033,10 +1033,25 @@ class Executor(RemoteExecutor):
                 script_path.write_text("\n".join(script_lines))
                 script_path.chmod(0o755)
 
+                # SGE only allows one shared -o/-e path per qsub call, so true
+                # per-task (per-subject) log sharding isn't possible for an
+                # array -- but each sub-range here is already its own separate
+                # qsub call, so sharding by sub-range still bounds any single
+                # directory to at most array_limit x 2 files instead of every
+                # task from every run over the life of the project piling into
+                # one flat directory. Confirmed hitting a real failure mode:
+                # 65,080 files in one .snakemake/sge_logs/ dir on a live EPAD
+                # run caused qsub itself to fail with a spurious "can't stat()
+                # ... Permission denied" on the log path (the directory and
+                # its ownership were both fine -- this is an NFS large-flat-
+                # directory scaling failure, not an actual permission issue).
+                sub_range_logdir = first_job_logdir / f"chunk{chunk_num}_{sub_chunk}_{sub_range_num}"
+                sub_range_logdir.mkdir(parents=True, exist_ok=True)
+
                 job_params = {
                     "run_uuid": self.run_uuid,
-                    "log_stdout": first_job_logdir / "$JOB_ID.$TASK_ID.log",
-                    "log_stderr": first_job_logdir / "$JOB_ID.$TASK_ID.error",
+                    "log_stdout": sub_range_logdir / "$JOB_ID.$TASK_ID.log",
+                    "log_stderr": sub_range_logdir / "$JOB_ID.$TASK_ID.error",
                     "workdir": workdir,
                     "array_range": task_spec,
                 }
@@ -1115,8 +1130,8 @@ class Executor(RemoteExecutor):
 
                 for idx, job in zip(sub_idxs, sub_jobs):
                     external_id = f"{sge_jobid}.{idx}"
-                    log_o = first_job_logdir / f"{sge_jobid}.{idx}.log"
-                    log_e = first_job_logdir / f"{sge_jobid}.{idx}.error"
+                    log_o = sub_range_logdir / f"{sge_jobid}.{idx}.log"
+                    log_e = sub_range_logdir / f"{sge_jobid}.{idx}.error"
                     self._report_submission_threadsafe(
                         SubmittedJobInfo(
                             job,
