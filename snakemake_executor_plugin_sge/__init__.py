@@ -895,12 +895,37 @@ class Executor(RemoteExecutor):
         # -hold_jid_ad can align tasks purely by subject identity.
         subject_idxs = [self._get_or_assign_subject_idx(j) for j in jobs]
 
-        # Build the compressed task → command map keyed by global subject index.
-        # All chunks of this call share one map file so submission scripts
-        # look up by $SGE_TASK_ID directly.
+        # Build the compressed task → {cmd, workdir} map keyed by global subject
+        # index. All chunks of this call share one map file so submission
+        # scripts look up by $SGE_TASK_ID directly.
+        #
+        # workdir is embedded per-task and NOT the same as the array's shared
+        # -wd (SGE only allows one -wd for the whole array, always
+        # workflow.workdir_init -- see below). Without a per-task cd before
+        # eval, the compute node's cwd stays at the shared array-wide -wd for
+        # every task, and Snakemake's own singularity wrapper computes
+        # --home from os.getcwd() at that point -- so every task in the array
+        # ends up sharing the SAME --home directory (observed: tasks other
+        # than the one whose subject happens to match the shared -wd's
+        # resolved DAG state all get the wrong --home and collide on
+        # container home-dir binds, surfacing as spurious "Read-only file
+        # system" errors on their first NFS write). Restoring the correct
+        # per-job cwd here before eval matches what run_job() already does
+        # correctly for non-array (single-job) submission.
         task_map = {
             str(idx): base64.b64encode(
-                zlib.compress(self.format_job_exec(job).encode("utf-8"), level=9)
+                zlib.compress(
+                    json.dumps(
+                        {
+                            "cmd": self.format_job_exec(job),
+                            "workdir": str(
+                                job.resources.get("workdir")
+                                or self.workflow.workdir_init
+                            ),
+                        }
+                    ).encode("utf-8"),
+                    level=9,
+                )
             ).decode()
             for idx, job in zip(subject_idxs, jobs)
         }
@@ -974,18 +999,30 @@ class Executor(RemoteExecutor):
                     "# Avoids ARG_MAX issues for large arrays (150+ tasks).",
                     f"export TASK_MAP_FILE={shlex.quote(str(task_map_file))}",
                     "",
-                    "# Decode the exec command for this task from the task map.",
+                    "# Decode the exec command + workdir for this task from the task map.",
                     "# $SGE_TASK_ID is the global subject index for this task.",
                     "export _tid=${SGE_TASK_ID}",
-                    "_cmd=$(",
-                    "  python3 - <<'PYEOF'",
+                    "_decode() {",
+                    "  python3 - <<PYEOF",
                     "import sys, base64, zlib, json, os",
                     "task_map = json.loads(base64.b64decode(open(os.environ['TASK_MAP_FILE']).read()))",
                     "tid = str(os.environ['_tid'])",
-                    "cmd = zlib.decompress(base64.b64decode(task_map[tid])).decode()",
-                    "sys.stdout.write(cmd)",
+                    "entry = json.loads(zlib.decompress(base64.b64decode(task_map[tid])))",
+                    "sys.stdout.write(entry['$1'])",
                     "PYEOF",
-                    ")",
+                    "}",
+                    "_workdir=$(_decode workdir)",
+                    "_cmd=$(_decode cmd)",
+                    "",
+                    "# SGE's own -wd (below) is necessarily the same for every task in the",
+                    "# array (SGE has no per-task working-directory flag), always the shared",
+                    "# workflow root -- so it cannot be this task's own subject directory.",
+                    "# cd into this task's real directory here before eval, or Snakemake's",
+                    "# singularity wrapper computes --home from os.getcwd() using the shared",
+                    "# array-wide cwd, and every task in the array ends up pointed at the same",
+                    "# (wrong, for all but coincidentally-matching tasks) container home dir.",
+                    "for _i in 1 2 3 4 5 6; do mkdir -p \"$_workdir\" 2>/dev/null && break; sleep 5; done",
+                    "cd \"$_workdir\"",
                     "",
                     "eval \"$_cmd\"",
                 ]
