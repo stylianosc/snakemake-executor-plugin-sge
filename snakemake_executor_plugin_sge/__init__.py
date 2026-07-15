@@ -1268,10 +1268,27 @@ class Executor(RemoteExecutor):
                         path.unlink()
                 except OSError as exc:
                     self.logger.warning(f"Could not delete log {path}: {exc}")
-        # Clean up empty directories
+        # Clean up empty directories -- but only ones old enough to clear the
+        # same age cutoff as files. shutdown() runs at the end of EVERY
+        # Snakemake invocation and sweeps the whole shared sge_logdir tree,
+        # not just directories this invocation created. A per-sub-range log
+        # directory is mkdir'd at submission time but stays empty until its
+        # first task actually starts on a compute node -- if that job is
+        # still queued (qw/hqw) when a DIFFERENT, unrelated Snakemake
+        # invocation finishes and runs its own cleanup, an unconditional
+        # rmdir() on "empty" directories deletes it before the queued job
+        # ever gets to use it, and every task in that array then fails
+        # immediately with "can't open output file: No such file or
+        # directory" as soon as it's dispatched. Gating on directory mtime
+        # (which only advances when a file is created/deleted inside it, so
+        # a freshly-mkdir'd unused directory keeps a recent mtime) preserves
+        # the original intent -- reclaim genuinely stale leftovers -- without
+        # racing still-pending jobs from other invocations.
         for path in sorted(self.sge_logdir_default.rglob("*"), reverse=True):
             if path.is_dir():
                 try:
+                    if now - path.stat().st_mtime <= cutoff_secs:
+                        continue
                     path.rmdir()  # Only removes if empty
                 except OSError:
                     pass
