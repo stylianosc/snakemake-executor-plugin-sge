@@ -357,6 +357,21 @@ class Executor(RemoteExecutor):
         self._job_submission_executor = ThreadPoolExecutor(
             max_workers=4, thread_name_prefix="sge_job_submit"
         )
+
+        # Debounce for "failed" status reports. A single qstat/qacct poll
+        # reporting a job as failed is trusted immediately today, which lets
+        # one transient accounting glitch (SGE briefly flagging a task as
+        # failed, e.g. after a momentary qacct/qstat inconsistency) cascade
+        # into Snakemake cancelling the entire run. Confirmed on a real EPAD
+        # process-all run (2026-07-28): task 7118778.101 was reported
+        # "failed" and triggered a mass cancellation of ~680 remaining DAG
+        # steps, but its actual output files (whole_brain_metrics.csv etc.)
+        # were present, complete, and correctly timestamped -- the job had
+        # genuinely succeeded. Requiring the same job to report "failed" on
+        # two consecutive independent polls before acting on it filters out
+        # this class of one-off transient misreport while still catching
+        # jobs that are actually, persistently failed.
+        self._failed_confirm_counts: Dict[str, int] = {}
         self._main_event_loop: Optional[asyncio.AbstractEventLoop] = None
 
         # Track submitted job IDs for cancellation
@@ -1203,25 +1218,41 @@ class Executor(RemoteExecutor):
                 continue
 
             if status == "finished":
+                self._failed_confirm_counts.pop(j.external_jobid, None)
                 self.report_job_success(j)
                 any_finished = True
                 if not settings.keep_successful_logs:
                     self._delete_job_logs(j)
             elif status == "failed":
+                confirm_count = self._failed_confirm_counts.get(j.external_jobid, 0) + 1
+                self._failed_confirm_counts[j.external_jobid] = confirm_count
+                if confirm_count < 2:
+                    # First "failed" report -- could be a transient qstat/qacct
+                    # glitch (see __post_init__ docstring). Keep polling instead
+                    # of acting on it immediately.
+                    self.logger.warning(
+                        f"SGE job '{j.external_jobid}' reported failed "
+                        f"(1st observation) -- will re-check before reporting "
+                        f"as a real failure."
+                    )
+                    yield j
+                    continue
                 log_files = [
                     str(j.aux.get("log_stdout", "")),
                     str(j.aux.get("log_stderr", "")),
                 ]
+                self._failed_confirm_counts.pop(j.external_jobid, None)
                 self.report_job_error(
                     j,
                     msg=(
-                        f"SGE job '{j.external_jobid}' failed. "
-                        f"Check logs: {log_files}"
+                        f"SGE job '{j.external_jobid}' failed (confirmed on "
+                        f"2 consecutive polls). Check logs: {log_files}"
                     ),
                     aux_logs=[lf for lf in log_files if lf],
                 )
             else:
                 # running / pending
+                self._failed_confirm_counts.pop(j.external_jobid, None)
                 yield j
 
         if not any_finished:
