@@ -315,7 +315,18 @@ def get_submit_command(
 
     # ── working directory ──────────────────────────────────────────────
     if workdir:
-        call += f" -wd {_safe(workdir)}"
+        # Deliberately NOT `-wd {workdir}` here. SGE's native -wd does a
+        # hard chdir the moment the job actually starts running -- which,
+        # under -hold_jid/-hold_jid_ad, can be hours or days after
+        # submission. workdir is created above at submission time, but
+        # nothing guarantees it still exists that much later (confirmed in
+        # practice: several jobs failed with "can't chdir ... No such file
+        # or directory" despite this exact mkdir having run at submission).
+        # log_dir is stable for the job's whole lifetime, so SGE's own
+        # chdir never hard-fails; the *real* workdir is instead created and
+        # entered as part of the executed command itself (see below), right
+        # when it actually runs -- the only point in time that matters.
+        call += f" -wd {_safe(str(log_dir))}"
     else:
         call += " -cwd"
 
@@ -505,10 +516,23 @@ def get_submit_command(
         call += f" {sge_extra}"
 
     # ── submission script or command ────────────────────────────────────
+    # When a workdir was requested, enter it as the first thing the job
+    # actually does -- not via SGE's own -wd (see above) -- so the
+    # directory is guaranteed fresh at the moment it's needed, regardless
+    # of how long the job sat held in the queue first. workdir's own path
+    # is quoted once here; the resulting prefix is plain shell text meant
+    # to be concatenated, then the *whole* combined command is quoted
+    # exactly once below before being handed to the shell.
+    cd_prefix = f"mkdir -p {_safe(str(workdir))} && cd {_safe(str(workdir))} && " if workdir else ""
+
     if script_path:
-        call += f" {_safe(script_path)}"
+        if cd_prefix:
+            inner = f"{cd_prefix}exec bash {_safe(script_path)}"
+            call = f"echo {_safe(inner)} | {call}"
+        else:
+            call += f" {_safe(script_path)}"
     elif exec_cmd:
         # Pass the command via stdin if there is no script
-        call = f"echo {_safe(exec_cmd)} | {call}"
+        call = f"echo {_safe(cd_prefix + exec_cmd)} | {call}"
 
     return call

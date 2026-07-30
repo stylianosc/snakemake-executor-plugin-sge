@@ -288,10 +288,17 @@ def test_no_v_when_export_env_false():
     assert " -V" not in cmd
 
 def test_workdir(tmp_path):
+    """When a workdir is requested, SGE's native -wd points at the stable
+    log_dir (never hard-fails), and the real workdir is instead created and
+    entered by the executed command itself -- so it's guaranteed fresh at
+    the moment the job actually runs, not just at submission time."""
     workdir = tmp_path / "work"
     params = dict(PARAMS, workdir=str(workdir))
     cmd = get_submit_command(FakeJob(), params, FakeSettings(), "/s.sh", "1-1")
-    assert f"-wd {workdir}" in cmd
+    assert f"-wd {PARAMS['log_dir']}" in cmd
+    assert f"-wd {workdir}" not in cmd
+    assert f"mkdir -p {workdir} && cd {workdir} &&" in cmd
+    assert "exec bash 1-1" in cmd  # script_path in this call is "1-1" (see signature: exec_cmd, then script_path)
 
 def test_resource_workdir_overrides_param_workdir(tmp_path):
     param_workdir = tmp_path / "param_work"
@@ -304,8 +311,20 @@ def test_resource_workdir_overrides_param_workdir(tmp_path):
         "/s.sh",
         "1-1",
     )
-    assert f"-wd {resource_workdir}" in cmd
-    assert f"-wd {param_workdir}" not in cmd
+    assert f"mkdir -p {resource_workdir} && cd {resource_workdir} &&" in cmd
+    assert str(param_workdir) not in cmd
+
+def test_workdir_with_exec_cmd_no_script_path(tmp_path):
+    """Same guarantee for the exec_cmd (no script_path) code path -- the
+    piped stdin command must also mkdir+cd into workdir before the real
+    command, not just the script_path branch."""
+    workdir = tmp_path / "work"
+    params = dict(PARAMS, workdir=str(workdir))
+    cmd = get_submit_command(FakeJob(), params, FakeSettings(), exec_cmd="run-this")
+    assert f"-wd {PARAMS['log_dir']}" in cmd
+    assert f"mkdir -p {workdir} && cd {workdir} &&" in cmd
+    assert "run-this" in cmd
+    assert cmd.startswith("echo ")
 
 def test_no_workdir_uses_cwd():
     p = dict(PARAMS, workdir="")
