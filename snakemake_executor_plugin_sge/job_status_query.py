@@ -239,6 +239,21 @@ async def query_job_status(
                 acct_status = None
 
             if acct_status is not None:
+                if acct_status == "finished":
+                    # Don't trust qacct's exit-code bookkeeping blindly
+                    # either: confirmed in practice that a job whose actual
+                    # shell command failed (non-zero exit, real error
+                    # printed, no output produced) was still reported
+                    # "finished" via this exact path -- the failure occurred
+                    # inside a nested sub-invocation whose exit code didn't
+                    # propagate up to what qacct recorded for the outer SGE
+                    # task (a Snakemake/scheduler-level exit-code plumbing
+                    # gap outside what this plugin controls). Cross-check
+                    # against the job's own declared output before trusting
+                    # "finished" from qacct too, not just from the fallback
+                    # paths below.
+                    outputs_ok = _job_outputs_exist(j) if j is not None else None
+                    acct_status = "failed" if outputs_ok is False else "finished"
                 status_map[jid] = acct_status
                 if j is not None and j.aux is not None:
                     j.aux.pop("first_qacct_miss", None)
