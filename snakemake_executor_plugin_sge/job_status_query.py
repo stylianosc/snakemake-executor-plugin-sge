@@ -42,6 +42,30 @@ def is_qacct_available() -> bool:
     return shutil.which("qacct") is not None
 
 
+def _job_outputs_exist(job_info) -> Optional[bool]:
+    """Check a job's own declared output files on disk.
+
+    Returns True if every declared output exists, False if any is missing,
+    or None if the job's output list can't be introspected (be
+    conservative and let the caller fall back to its default behavior
+    rather than guess).
+
+    Used as the ground-truth check whenever a job's status can't be
+    confirmed via qstat/qacct: "gone from the scheduler and unconfirmable"
+    is ambiguous between "succeeded, just untracked" and "silently
+    rejected/failed before ever running" -- checking the real output
+    distinguishes the two instead of assuming success either way.
+    """
+    try:
+        outputs = list(job_info.job.output)
+    except Exception:
+        return None
+    if not outputs:
+        return None
+    import os
+    return all(os.path.exists(str(f)) for f in outputs)
+
+
 # ---------------------------------------------------------------------------
 # qstat parsing
 # ---------------------------------------------------------------------------
@@ -240,16 +264,42 @@ async def query_job_status(
                     if first_miss is None:
                         j.aux["first_qacct_miss"] = time.time()
                     elif time.time() - first_miss > 90:
-                        logger.warning(
-                            f"Job {jid} left qstat and qacct has not "
-                            f"recorded it for >90s; assuming finished "
-                            f"(qacct accounting may be unavailable on this "
-                            f"cluster)."
-                        )
-                        status_map[jid] = "finished"
+                        # Don't just assume success: a job that's gone from
+                        # qstat with qacct unable to confirm it either way is
+                        # ambiguous between "succeeded, just untracked" and
+                        # "silently rejected/failed before ever producing
+                        # anything" (confirmed happening in practice: a job
+                        # was reported "finished" this way while its declared
+                        # output was never created -- Snakemake had genuinely
+                        # never run it). Check the job's own declared outputs
+                        # to tell the two apart.
+                        outputs_ok = _job_outputs_exist(j)
+                        if outputs_ok is False:
+                            logger.warning(
+                                f"Job {jid} left qstat and qacct has not "
+                                f"recorded it for >90s, and its declared "
+                                f"output is missing -- treating as failed "
+                                f"(qacct accounting may be unavailable on "
+                                f"this cluster)."
+                            )
+                            status_map[jid] = "failed"
+                        else:
+                            # outputs_ok is True, or None (couldn't check --
+                            # be permissive rather than block forever).
+                            logger.warning(
+                                f"Job {jid} left qstat and qacct has not "
+                                f"recorded it for >90s; "
+                                + ("its declared output exists, " if outputs_ok else "its output couldn't be verified, ")
+                                + "treating as finished."
+                            )
+                            status_map[jid] = "finished"
         else:
-            # qacct disabled or unavailable: assume finished since it's old enough
-            # and no longer in qstat.
-            status_map[jid] = "finished"
+            # qacct disabled or unavailable: assume finished since it's old
+            # enough and no longer in qstat -- but verify against the job's
+            # own declared output first where possible, for the same reason
+            # as above (a silently-rejected job must not be reported as a
+            # false success).
+            outputs_ok = _job_outputs_exist(j) if j is not None else None
+            status_map[jid] = "failed" if outputs_ok is False else "finished"
 
     return status_map
