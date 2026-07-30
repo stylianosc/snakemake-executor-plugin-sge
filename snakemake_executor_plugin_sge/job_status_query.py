@@ -216,8 +216,37 @@ async def query_job_status(
 
             if acct_status is not None:
                 status_map[jid] = acct_status
+                if j is not None and j.aux is not None:
+                    j.aux.pop("first_qacct_miss", None)
             else:
-                pass
+                # qacct is nominally available (the binary is on PATH) but is
+                # returning no record for this job. This isn't necessarily
+                # transient: on this cluster qacct's underlying accounting
+                # store has been observed missing entirely
+                # ("/opt/gridengine/default/common/accounting: No such file
+                # or directory"), meaning acct_status is None *every* poll,
+                # forever -- with no escalation, a job that already left
+                # qstat (confirmed above) would stay "still queued" in
+                # Snakemake's view permanently, even though the scheduler has
+                # long since disposed of it. Give qacct a further grace
+                # period to catch up (it may just be slow to record), then
+                # fall back to the same "assume finished" treatment already
+                # used when qacct is unavailable outright -- Snakemake will
+                # re-derive the true state from the job's actual output file
+                # the next time something downstream needs it, which is
+                # always the ground truth anyway.
+                if j is not None and j.aux is not None:
+                    first_miss = j.aux.get("first_qacct_miss")
+                    if first_miss is None:
+                        j.aux["first_qacct_miss"] = time.time()
+                    elif time.time() - first_miss > 90:
+                        logger.warning(
+                            f"Job {jid} left qstat and qacct has not "
+                            f"recorded it for >90s; assuming finished "
+                            f"(qacct accounting may be unavailable on this "
+                            f"cluster)."
+                        )
+                        status_map[jid] = "finished"
         else:
             # qacct disabled or unavailable: assume finished since it's old enough
             # and no longer in qstat.
