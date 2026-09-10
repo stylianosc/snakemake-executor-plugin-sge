@@ -41,7 +41,10 @@ class Job:
     """A stand-in for a Snakemake job: identified by (rule, subject)."""
 
     def __init__(self, rule, subject):
-        self.rule = rule
+        # Real Snakemake jobs expose .rule as a Rule object with .name, not
+        # a bare string -- match that shape since the plugin reads
+        # job.rule.name (_split_by_downstream_boundaries).
+        self.rule = types.SimpleNamespace(name=rule)
         self.subject = subject
         self.name = f"{rule}:{subject}"
 
@@ -82,12 +85,20 @@ class Simulator:
                     up[self.jobs[(ur, s)]] = None
             deps[job] = up
 
+        # Forward edges (dag.depending): the exact inverse of deps, mirroring
+        # what the real DAG.update() populates alongside dependencies before
+        # any submission begins.
+        depending = {job: {} for job in self.jobs.values()}
+        for job, ups in deps.items():
+            for up_job in ups:
+                depending[up_job][job] = None
+
         # A bare Executor with only the state the hold methods touch.
         ex = Executor.__new__(Executor)
         ex.logger = logging.getLogger("sim")
         ex.logger.addHandler(logging.NullHandler())
         ex.workflow = types.SimpleNamespace(
-            dag=types.SimpleNamespace(dependencies=deps)
+            dag=types.SimpleNamespace(dependencies=deps, depending=depending)
         )
         ex._job_to_sge = {}
         ex._array_job_range = {}
@@ -98,8 +109,15 @@ class Simulator:
         self._next_jobid += 1
         return f"J{self._next_jobid}"
 
-    def submit_rule(self, rule):
+    def submit_rule(self, rule, use_downstream_split=True):
         """Simulate submitting one rule as SGE array sub-jobs.
+
+        ``use_downstream_split=False`` reproduces the plugin's behavior
+        *before* _split_by_downstream_boundaries existed -- both code paths
+        are real methods on the real Executor (nothing is stubbed out or
+        skipped via a nonexistent function), this just omits one real step
+        from the pipeline to let "before" and "after" be compared directly
+        against the SAME scenario without git-stashing the source.
 
         Returns a list of ``(sub_start, sub_end, hold_ad, hold_jid_list)`` for
         each sub-range actually submitted, so the caller can assert on them.
@@ -109,6 +127,8 @@ class Simulator:
         idx_to_job = {self.idx[s]: self.jobs[(rule, s)] for s in run_subjects}
 
         contiguous = self.ex._split_contiguous_ranges(idxs)
+        if use_downstream_split:
+            contiguous = self.ex._split_by_downstream_boundaries(contiguous, idx_to_job)
         sub_ranges = self.ex._split_by_upstream_boundaries(contiguous, idx_to_job)
 
         submitted = []
@@ -237,9 +257,24 @@ def test_staggered_completion_stays_sge_valid():
     assert got_per_task, subs["sink"]
 
 
-def test_sequential_partial_falls_back_cleanly():
-    """A sequential child whose parent spans a wider range must fall back to
-    whole-job -hold_jid (SGE would reject a subset -hold_jid_ad)."""
+def test_sequential_partial_gets_per_task_hold_via_downstream_split():
+    """Regression test for the real cluster case (2026-09-01): root is
+    submitted as one wide array (1-5), but branch_a's own need-set is only
+    a fragment of it (3-4 -- e.g. subjects 1,2,5 had a data gap upstream
+    of root, or simply never needed branch_a). Before
+    _split_by_downstream_boundaries existed, root had no way to know
+    branch_a only needed 3-4, so it stayed one monolithic 1-5 array and
+    branch_a's 3-4 fragment could never find an exact-range match -- this
+    exact assertion (hold_ad is None, whole-job fallback) used to be the
+    documented-correct behavior in this test (see git history) before the
+    fix. With the fix, root pre-splits itself at the point where branch_a's
+    need-presence changes (a boundary at 3-4 vs. 1-2/5), so branch_a's
+    fragment finds a matching root sub-range and gets a real -hold_jid_ad.
+
+    This test FAILS against the pre-fix code (hold_ad was None there) and
+    PASSES against the fix -- i.e. it is the direct regression test for
+    _split_by_downstream_boundaries, not just a generic invariant check.
+    """
     subjects = [f"sub{i:02d}" for i in range(1, 6)]
     alls = set(subjects)
     needed = {
@@ -253,13 +288,55 @@ def test_sequential_partial_falls_back_cleanly():
     sim.submit_rule("root")
     branch = sim.submit_rule("branch_a")
 
-    # branch_a runs 3-4 while root is 1-5: ranges differ, so root must be held
-    # whole-job, NOT per-task (which SGE would reject).
+    # branch_a runs 3-4; with downstream-boundary splitting, root itself was
+    # pre-split so a 3-4 root sub-range exists, letting branch_a get a real
+    # per-task -hold_jid_ad instead of falling back to whole-job -hold_jid.
     assert len(branch) == 1
     sub_start, sub_end, hold_ad, hold_jid = branch[0]
     assert (sub_start, sub_end) == (3, 4)
+    assert hold_ad is not None, (
+        "expected a per-task -hold_jid_ad now that root pre-splits at "
+        "branch_a's own need-set boundary -- got whole-job fallback instead, "
+        "meaning _split_by_downstream_boundaries did not fire as expected"
+    )
+    assert hold_jid == []
+    assert_sge_would_accept(sim, sub_start, sub_end, hold_ad, hold_jid)
+    assert_no_dependency_dropped(
+        sim, "branch_a", sub_start, sub_end, hold_ad, hold_jid
+    )
+
+
+def test_nonarray_upstream_still_falls_back_cleanly():
+    """A downstream job whose upstream was submitted as a single non-array
+    task (task_idx is None) has no per-task index to align against at all
+    -- this must still cleanly fall back to whole-job -hold_jid regardless
+    of the downstream-boundary-splitting fix, since there is no array range
+    on the upstream side to split in the first place. Matches the OTHER
+    real cluster case this session (a single-subject z-score job with no
+    matching array range on either side)."""
+    subjects = [f"sub{i:02d}" for i in range(1, 6)]
+    sim = Simulator(subjects, RULE_DEPS, {
+        "root": set(subjects),
+        "branch_a": {"sub03"},
+        "branch_b": set(),
+        "branch_c": set(),
+        "sink": set(),
+    })
+    sim.submit_rule("root")
+
+    # Manually downgrade root's recorded submission to a non-array (single
+    # task) entry for sub03, as if it had been submitted individually
+    # rather than as part of root's 1-5 array.
+    root_job = sim.jobs[("root", "sub03")]
+    single_jobid = sim._new_jobid()
+    sim.ex._job_to_sge[root_job] = (single_jobid, None)
+    sim.ex._array_job_range.pop(single_jobid, None)
+
+    branch = sim.submit_rule("branch_a")
+    assert len(branch) == 1
+    sub_start, sub_end, hold_ad, hold_jid = branch[0]
     assert hold_ad is None, hold_ad
-    assert len(hold_jid) == 1
+    assert hold_jid == [single_jobid]
     assert_sge_would_accept(sim, sub_start, sub_end, hold_ad, hold_jid)
     assert_no_dependency_dropped(
         sim, "branch_a", sub_start, sub_end, hold_ad, hold_jid
@@ -290,3 +367,168 @@ def test_exhaustive_random_completion_levels():
                 assert_no_dependency_dropped(
                     sim, rule, sub_start, sub_end, hold_ad, hold_jid
                 )
+
+
+# --------------------------------------------------------------------------- #
+# Real cluster case (2026-09-01, EPAD): tracula_gif -> tractqc_gif ->
+# metrics_gif. tractqc_gif was submitted as one whole array over global
+# subject indices 164-250 (real job 7314183); metrics_gif's own need-set
+# within that range was fragmented into exactly three pieces -- {236},
+# {238,239,240}, {244..250} -- matching the real observed jobs 7314218
+# (1 task), 7314219 (3 tasks), 7314220 (7 tasks). Real subject IDs aren't
+# reproduced (not needed for this), but the rule names, the range, and the
+# exact fragmentation shape are the real ones, not placeholders.
+# --------------------------------------------------------------------------- #
+EPAD_RULE_DEPS = {
+    "tracula_gif": [],
+    "tractqc_gif": ["tracula_gif"],
+    "metrics_gif": ["tractqc_gif"],
+}
+EPAD_SUBJECTS = [f"sub{i}" for i in range(164, 251)]  # 87 subjects, real range
+METRICS_GIF_NEEDED = {"sub236", "sub238", "sub239", "sub240",
+                       "sub244", "sub245", "sub246", "sub247", "sub248", "sub249", "sub250"}
+
+
+def _tractqc_jobid_for(sim, subject):
+    return sim.ex._job_to_sge[sim.jobs[("tractqc_gif", subject)]][0]
+
+
+def _real_range(sim, lo, hi):
+    """Real subject numbers (e.g. 236, 250) -> the Simulator's own internal
+    1-based global index range -- the Simulator assigns indices by list
+    position, not by parsing the subject name, so real subject numbers and
+    internal indices are different numbering schemes related by a fixed
+    offset. Expressing expected ranges this way keeps the test readable in
+    real subject numbers while staying correct against however the
+    Simulator actually assigns indices."""
+    return (sim.idx[f"sub{lo}"], sim.idx[f"sub{hi}"])
+
+
+def test_real_epad_metrics_gif_case_reproduces_old_bug():
+    """Without _split_by_downstream_boundaries: tractqc_gif stays one whole
+    164-250 array, so every metrics_gif fragment falls back to whole-job
+    -hold_jid on it -- reproducing job 7314218/7314219/7314220's real
+    situation exactly (blocked on the entire tractqc_gif array, including
+    subjects they have nothing to do with)."""
+    needed = {
+        "tracula_gif": set(EPAD_SUBJECTS),
+        "tractqc_gif": set(EPAD_SUBJECTS),
+        "metrics_gif": set(METRICS_GIF_NEEDED),
+    }
+    sim = Simulator(EPAD_SUBJECTS, EPAD_RULE_DEPS, needed)
+    sim.submit_rule("tracula_gif", use_downstream_split=False)
+    tractqc_subs = sim.submit_rule("tractqc_gif", use_downstream_split=False)
+
+    # tractqc_gif: one whole array, exactly like the real job 7314183.
+    assert [(s, e) for s, e, _, _ in tractqc_subs] == [_real_range(sim, 164, 250)]
+    tractqc_jobid = _tractqc_jobid_for(sim, "sub164")
+
+    metrics_subs = sim.submit_rule("metrics_gif", use_downstream_split=False)
+
+    # metrics_gif still fragments into 3 pieces on its OWN need-set alone
+    # (that part doesn't need the fix) -- matches the real 236 / 238-240 /
+    # 244-250 job split.
+    assert [(s, e) for s, e, _, _ in metrics_subs] == [
+        _real_range(sim, 236, 236), _real_range(sim, 238, 240), _real_range(sim, 244, 250),
+    ]
+
+    # The bug: every fragment falls back to the SAME whole-job tractqc_gif
+    # hold, with no per-task -hold_jid_ad at all.
+    for sub_start, sub_end, hold_ad, hold_jid in metrics_subs:
+        assert hold_ad is None, (sub_start, sub_end, hold_ad)
+        assert hold_jid == [tractqc_jobid], (sub_start, sub_end, hold_jid, tractqc_jobid)
+        assert_sge_would_accept(sim, sub_start, sub_end, hold_ad, hold_jid)
+        assert_no_dependency_dropped(sim, "metrics_gif", sub_start, sub_end, hold_ad, hold_jid)
+
+
+def test_real_epad_metrics_gif_case_fixed():
+    """With the fix: tractqc_gif pre-splits itself at metrics_gif's own
+    need-set boundaries, so each metrics_gif fragment finds an
+    exact-range tractqc_gif counterpart and gets a real per-task
+    -hold_jid_ad instead of the whole-job fallback."""
+    needed = {
+        "tracula_gif": set(EPAD_SUBJECTS),
+        "tractqc_gif": set(EPAD_SUBJECTS),
+        "metrics_gif": set(METRICS_GIF_NEEDED),
+    }
+    sim = Simulator(EPAD_SUBJECTS, EPAD_RULE_DEPS, needed)
+    sim.submit_rule("tracula_gif")
+    tractqc_subs = sim.submit_rule("tractqc_gif")
+
+    # tractqc_gif is now pre-split at metrics_gif's need-set boundaries:
+    # 164-235 nobody-downstream-needs-differently, 236 needed, 237 not
+    # needed, 238-240 needed, 241-243 not needed, 244-250 needed.
+    expected_tractqc = [(164, 235), (236, 236), (237, 237), (238, 240), (241, 243), (244, 250)]
+    assert [(s, e) for s, e, _, _ in tractqc_subs] == [_real_range(sim, lo, hi) for lo, hi in expected_tractqc]
+    tractqc_range_to_jobid = {
+        (s, e): _tractqc_jobid_for(sim, EPAD_SUBJECTS[s - 1]) for s, e, _, _ in tractqc_subs
+    }
+
+    metrics_subs = sim.submit_rule("metrics_gif")
+
+    # Same 3 real fragments as before -- the fix doesn't change WHAT
+    # metrics_gif submits, only what it can hold on.
+    assert [(s, e) for s, e, _, _ in metrics_subs] == [
+        _real_range(sim, 236, 236), _real_range(sim, 238, 240), _real_range(sim, 244, 250),
+    ]
+
+    for sub_start, sub_end, hold_ad, hold_jid in metrics_subs:
+        expected_jobid = tractqc_range_to_jobid[(sub_start, sub_end)]
+        assert hold_ad == expected_jobid, (
+            f"metrics_gif {sub_start}-{sub_end}: expected per-task hold on "
+            f"{expected_jobid}, got hold_ad={hold_ad!r} hold_jid={hold_jid!r}"
+        )
+        assert hold_jid == []
+        assert_sge_would_accept(sim, sub_start, sub_end, hold_ad, hold_jid)
+        assert_no_dependency_dropped(sim, "metrics_gif", sub_start, sub_end, hold_ad, hold_jid)
+
+
+def test_real_epad_case_two_downstream_consumers_different_gaps():
+    """Two rules consume tractqc_gif with DIFFERENT, only partially
+    overlapping need-sets (metrics_gif's real gap pattern, plus a second
+    consumer needing an unrelated pair of subjects). The upstream split
+    must take the union of both rules' boundary points -- neither consumer
+    should regress to a whole-job fallback because of the other's
+    different gap shape."""
+    qc_report_needed = {"sub170", "sub236"}  # deliberately unrelated to metrics_gif's gaps
+    rule_deps = dict(EPAD_RULE_DEPS, qc_report_gif=["tractqc_gif"])
+    needed = {
+        "tracula_gif": set(EPAD_SUBJECTS),
+        "tractqc_gif": set(EPAD_SUBJECTS),
+        "metrics_gif": set(METRICS_GIF_NEEDED),
+        "qc_report_gif": set(qc_report_needed),
+    }
+    sim = Simulator(EPAD_SUBJECTS, rule_deps, needed)
+    sim.submit_rule("tracula_gif")
+    tractqc_subs = sim.submit_rule("tractqc_gif")
+
+    expected_tractqc = [
+        (164, 169), (170, 170), (171, 235), (236, 236),
+        (237, 237), (238, 240), (241, 243), (244, 250),
+    ]
+    assert [(s, e) for s, e, _, _ in tractqc_subs] == [_real_range(sim, lo, hi) for lo, hi in expected_tractqc]
+    tractqc_range_to_jobid = {
+        (s, e): _tractqc_jobid_for(sim, EPAD_SUBJECTS[s - 1]) for s, e, _, _ in tractqc_subs
+    }
+
+    metrics_subs = sim.submit_rule("metrics_gif")
+    qc_subs = sim.submit_rule("qc_report_gif")
+
+    assert [(s, e) for s, e, _, _ in metrics_subs] == [
+        _real_range(sim, 236, 236), _real_range(sim, 238, 240), _real_range(sim, 244, 250),
+    ]
+    assert [(s, e) for s, e, _, _ in qc_subs] == [_real_range(sim, 170, 170), _real_range(sim, 236, 236)]
+
+    # Both consumers get a real per-task hold on tractqc_gif -- the union
+    # split serves each rule's own shape, not just whichever was submitted
+    # first, and 236 is shared by both without conflict.
+    for rule, subs in (("metrics_gif", metrics_subs), ("qc_report_gif", qc_subs)):
+        for sub_start, sub_end, hold_ad, hold_jid in subs:
+            expected_jobid = tractqc_range_to_jobid[(sub_start, sub_end)]
+            assert hold_ad == expected_jobid, (
+                f"{rule} {sub_start}-{sub_end}: expected hold on {expected_jobid}, "
+                f"got hold_ad={hold_ad!r} hold_jid={hold_jid!r}"
+            )
+            assert hold_jid == []
+            assert_sge_would_accept(sim, sub_start, sub_end, hold_ad, hold_jid)
+            assert_no_dependency_dropped(sim, rule, sub_start, sub_end, hold_ad, hold_jid)

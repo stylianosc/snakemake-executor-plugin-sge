@@ -714,6 +714,59 @@ class Executor(RemoteExecutor):
                 result.append((current_run[0], current_run[-1], current_run))
         return result
 
+    def _split_by_downstream_boundaries(
+        self,
+        contiguous_ranges: List[Tuple[int, int, List[int]]],
+        idx_to_job: Dict[int, JobExecutorInterface],
+    ) -> List[Tuple[int, int, List[int]]]:
+        """Further split contiguous sub-ranges wherever a downstream
+        consumer's need for this subject changes.
+
+        Mirrors _split_by_upstream_boundaries but walks the DAG in the
+        opposite direction (dag.depending, populated in full before any
+        submission begins, even under --immediate-submit -- dag.init()
+        resolves both edge directions before JobScheduler.schedule() starts
+        dispatching waves).
+
+        Without this, an upstream rule submitted as one array over a wide
+        contiguous range can never produce an exact-range match for a
+        downstream rule whose own need-set is a fragmented subset of that
+        range (e.g. some subjects' upstream data has a gap, so a downstream
+        rule doesn't need them at all) -- confirmed against real cluster job
+        trees where a downstream fragment fell back to whole-job -hold_jid
+        and sat blocked behind unrelated, still-running tasks elsewhere in
+        the upstream's untouched remainder, even though its own actual
+        dependency had long since finished.
+
+        A no-op (single group per input range) in the common case where
+        every downstream consumer needs the whole range -- this only adds
+        splits where a real need-set boundary exists.
+        """
+        result: List[Tuple[int, int, List[int]]] = []
+        for (_, _, idxs) in contiguous_ranges:
+            current_key: Optional[frozenset] = None
+            current_run: List[int] = []
+            for idx in idxs:
+                job = idx_to_job[idx]
+                # Key = frozenset of downstream rule names that consume this
+                # subject's output. Rule name, not job identity: what matters
+                # is which downstream ARRAY this subject will eventually
+                # belong to, not the specific job object.
+                key = frozenset(
+                    down_job.rule.name
+                    for down_job in self.workflow.dag.depending.get(job, {})
+                )
+                if key != current_key:
+                    if current_run:
+                        result.append((current_run[0], current_run[-1], current_run))
+                    current_key = key
+                    current_run = [idx]
+                else:
+                    current_run.append(idx)
+            if current_run:
+                result.append((current_run[0], current_run[-1], current_run))
+        return result
+
     def _upstream_ext_ids(self, job):
         """Yield ``(upstream_job, sge_jobid, task_idx)`` for each upstream.
 
@@ -988,10 +1041,15 @@ class Executor(RemoteExecutor):
             chunk_idxs = subject_idxs[chunk_offset:chunk_offset + array_limit]
 
             idx_to_job = dict(zip(chunk_idxs, chunk_jobs))
-            # First split into contiguous runs, then further split at upstream
-            # SGE job ID boundaries so each sub-range sees at most one upstream
-            # array job — a prerequisite for -hold_jid_ad range alignment.
+            # First split into contiguous runs, then further split at
+            # downstream need-set boundaries (so this array itself doesn't
+            # span a point where some future consumer's need-presence
+            # changes) and upstream SGE job ID boundaries (so each sub-range
+            # sees at most one upstream array job per rule) — both are
+            # prerequisites for -hold_jid_ad range alignment, in either
+            # direction of the dependency edge.
             contiguous = self._split_contiguous_ranges(chunk_idxs)
+            contiguous = self._split_by_downstream_boundaries(contiguous, idx_to_job)
             sub_ranges = self._split_by_upstream_boundaries(contiguous, idx_to_job)
 
             for sub_range_num, (sub_start, sub_end, sub_idxs) in enumerate(sub_ranges, start=1):
