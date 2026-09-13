@@ -84,6 +84,48 @@ def _job_outputs_exist(job_info) -> Optional[bool]:
 _RUNNING_STATES = {"r", "t", "Rr", "s", "S", "T", "qw", "h", "hqw", "hRwq"}
 _ERROR_STATES   = {"Eqw", "Ec", "E", "d", "dr", "dt", "dRr", "dT"}
 
+# Error states worth one automatic retry, versus states that mean the job is on
+# its way out and must stay failed. A "d*" state is a deletion the user or the
+# scheduler asked for; clearing that would resurrect a job someone killed.
+_RETRYABLE_ERROR_STATES = {"Eqw", "Ec", "E"}
+_DELETING_STATES = {"d", "dr", "dt", "dRr", "dT"}
+
+# Jobs already given their one automatic clear, so a genuinely broken job fails
+# on the second observation instead of being cleared forever.
+_AUTO_CLEARED: set = set()
+
+
+def _try_clear_error_state(base_id: str, logger) -> bool:
+    """Clear a job's error state once, so SGE re-queues it.
+
+    Exists for a specific, recurring failure: a task can land on an execution
+    host before that host's NFS client sees the log directory created moments
+    earlier on the submitting host, and SGE fails it with "can't chdir to ...".
+    Nothing is wrong with the job -- the directory is there on the next look --
+    but the job sits in Eqw until someone runs qmod by hand.
+
+    Left alone this is far more damaging than one lost task: Snakemake's own
+    error handler raises KeyError while removing the job from its running set,
+    which aborts the whole workflow and cancels every job already submitted. A
+    single transient scheduling hiccup therefore destroys an entire submission.
+    """
+    if base_id in _AUTO_CLEARED:
+        return False
+    _AUTO_CLEARED.add(base_id)
+    try:
+        subprocess.check_output(
+            f"qmod -cj {base_id}", shell=True, text=True, stderr=subprocess.STDOUT
+        )
+        logger.warning(
+            f"SGE job {base_id} was in an error state; cleared it once "
+            f"automatically (usually a transient NFS visibility failure on the "
+            f"log directory). It will be reported as failed if it errors again."
+        )
+        return True
+    except subprocess.CalledProcessError as exc:
+        logger.warning(f"could not clear error state on {base_id}: {exc.output.strip()}")
+        return False
+
 
 def _poll_qstat(job_ids: List[str], logger) -> Dict[str, str]:
     """Return a {job_id: status} dict from qstat output.
@@ -126,9 +168,21 @@ def _poll_qstat(job_ids: List[str], logger) -> Dict[str, str]:
             jid for jid in job_ids
             if jid == base_id or jid.startswith(f"{base_id}.")
         ]
+        is_deleting = any(s in state for s in _DELETING_STATES)
+        is_retryable = (not is_deleting) and any(
+            s in state for s in _RETRYABLE_ERROR_STATES
+        )
+        cleared = False
+        if is_retryable:
+            cleared = _try_clear_error_state(base_id, logger)
+
         for jid in matched_ids:
-            if any(s in state for s in _ERROR_STATES):
+            if is_deleting:
                 result[jid] = "failed"
+            elif is_retryable:
+                # Keep it "running" while the cleared job gets its second chance;
+                # a still-broken job reports failed on the next poll.
+                result[jid] = "running" if cleared else "failed"
             else:
                 result[jid] = "running"
 

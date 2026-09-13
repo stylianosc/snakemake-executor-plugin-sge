@@ -58,6 +58,12 @@ from .submit_string import get_submit_command
 from .job_status_query import query_job_status, is_qstat_available, is_qacct_available
 from .job_cancellation import cancel_sge_jobs
 
+# How many sub-ranges to pre-create log directories for, per sub-chunk. A chunk
+# splits into more sub-ranges only where its subject indices are non-contiguous,
+# so this is generous for the usual case; any name beyond it still gets its
+# directory created on demand at submission.
+_SUB_RANGE_LOOKAHEAD = 12
+
 
 # ---------------------------------------------------------------------------
 # ExecutorSettings
@@ -1036,6 +1042,30 @@ class Executor(RemoteExecutor):
         # specification".  Each contiguous sub-range is its own array job,
         # which preserves the global subject index as the SGE task ID and
         # therefore keeps -hold_jid_ad alignment across rules intact.
+        # Create every per-sub-range log directory this call could need BEFORE
+        # submitting anything, rather than one at a time immediately before each
+        # qsub.
+        #
+        # SGE enters the job's log directory on the execution host. Creating it
+        # microseconds earlier on the submitting host leaves a window where the
+        # execution host's NFS client has not seen it yet, and SGE fails the task
+        # with "can't chdir to ...". The directory is always there on the next
+        # look, so nothing is actually wrong -- but Snakemake treats it as a real
+        # job failure, and its error handler then raises KeyError while removing
+        # the job from its running set, aborting the workflow and cancelling every
+        # job already submitted. One transient hiccup costs an entire submission;
+        # it cost OASIS-3 42 jobs at 91% complete.
+        #
+        # Hoisting the mkdir here gives NFS the whole submission loop to propagate
+        # instead of no time at all. The per-sub-range mkdir below stays as a
+        # fallback for any name this lookahead does not predict.
+        n_sub_chunks = max(1, -(-len(jobs) // array_limit))
+        for _sc in range(1, n_sub_chunks + 1):
+            for _sr in range(1, _SUB_RANGE_LOOKAHEAD + 1):
+                (first_job_logdir / f"chunk{chunk_num}_{_sc}_{_sr}").mkdir(
+                    parents=True, exist_ok=True
+                )
+
         for sub_chunk, chunk_offset in enumerate(range(0, len(jobs), array_limit), start=1):
             chunk_jobs = jobs[chunk_offset:chunk_offset + array_limit]
             chunk_idxs = subject_idxs[chunk_offset:chunk_offset + array_limit]
