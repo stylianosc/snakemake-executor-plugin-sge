@@ -754,12 +754,29 @@ class Executor(RemoteExecutor):
             current_run: List[int] = []
             for idx in idxs:
                 job = idx_to_job[idx]
-                # Key = frozenset of downstream rule names that consume this
-                # subject's output. Rule name, not job identity: what matters
-                # is which downstream ARRAY this subject will eventually
-                # belong to, not the specific job object.
+                # Key = frozenset of (downstream_rule_name, frozenset(upstream_dep_rules))
+                # pairs that consume this subject's output.
+                #
+                # Downstream array grouping is constrained by TWO factors:
+                # 1. Rule presence: which downstream array(s) this subject belongs to.
+                # 2. Dependency shape: whether the downstream job for this subject has
+                #    different active upstream dependencies in the DAG than its neighbours
+                #    (e.g. some subjects needed an extra upstream step like tractqc re-run,
+                #    while others already had it completed on disk).
+                #
+                # Without including upstream dependency rule names, an upstream array
+                # (like z_score) stays monolithic across subjects whose downstream consumers
+                # will inevitably fragment due to varying upstream prerequisites, causing
+                # all fragments of the downstream array to fall back to whole-job -hold_jid
+                # and sit in hqw (observed on ADNI-3 metrics_gif, 2026-09-15).
                 key = frozenset(
-                    down_job.rule.name
+                    (
+                        getattr(getattr(down_job, "rule", None), "name", None),
+                        frozenset(
+                            getattr(getattr(dep_job, "rule", None), "name", None)
+                            for dep_job in self.workflow.dag.dependencies.get(down_job, {})
+                        ),
+                    )
                     for down_job in self.workflow.dag.depending.get(job, {})
                 )
                 if key != current_key:

@@ -532,3 +532,73 @@ def test_real_epad_case_two_downstream_consumers_different_gaps():
             assert hold_jid == []
             assert_sge_would_accept(sim, sub_start, sub_end, hold_ad, hold_jid)
             assert_no_dependency_dropped(sim, rule, sub_start, sub_end, hold_ad, hold_jid)
+
+
+def test_downstream_varying_upstream_dependencies_causes_per_task_hold():
+    """Reproduces the ADNI-3 metrics_gif case (2026-09-15):
+    - Upstream rule (z_score) runs over all subjects (e.g. 1-30).
+    - Downstream rule 1 (metrics_freesurfer) runs over all subjects and only depends on z_score
+      (because its other dependency tractqc_freesurfer was already satisfied on disk).
+    - Downstream rule 2 (metrics_gif) runs over all subjects, but for a subset of subjects (e.g.
+      sub10, sub20), tractqc_gif needed to be re-run in this workflow.
+
+    Before the fix:
+    _split_by_downstream_boundaries only inspected downstream rule names (key = {'metrics_freesurfer',
+    'metrics_gif'}), which is identical for all subjects. Thus z_score stayed as one monolithic
+    1-30 array. When metrics_gif fragmented into 1-9, 10, 11-19, 20, 21-30 due to sub10/sub20 having
+    an additional upstream SGE dependency, none of its fragments could match z_score's (1, 30) range.
+    Consequently, all tasks of metrics_gif fell back to whole-job -hold_jid on z_score.
+
+    With the fix:
+    _split_by_downstream_boundaries includes the active upstream dependency rule names of each
+    downstream job in the key. z_score pre-splits at subjects 10 and 20 into (1, 9), (10, 10),
+    (11, 19), (20, 20), (21, 30). Every fragment of both metrics_gif and metrics_freesurfer finds
+    an exact-range match and receives a per-task -hold_jid_ad with zero whole-job holds.
+    """
+    subjects = [f"sub{i:02d}" for i in range(1, 31)]
+
+    rule_deps = {
+        "tracula_gif": [],
+        "tractqc_gif": ["tracula_gif"],
+        "metrics_gif": ["z_score", "tractqc_gif"],
+        "tracula_fs": [],
+        "tractqc_fs": ["tracula_fs"],
+        "metrics_fs": ["z_score", "tractqc_fs"],
+        "z_score": [],
+    }
+
+    needed = {
+        "z_score": set(subjects),
+        "metrics_gif": set(subjects),
+        "metrics_fs": set(subjects),
+        "tracula_fs": set(),
+        "tractqc_fs": set(),
+        "tracula_gif": {"sub10", "sub20"},
+        "tractqc_gif": {"sub10", "sub20"},
+    }
+
+    sim = Simulator(subjects, rule_deps, needed)
+    sim.submit_rule("tracula_gif")
+    sim.submit_rule("tractqc_gif")
+    z_subs = sim.submit_rule("z_score")
+    fs_subs = sim.submit_rule("metrics_fs")
+    gif_subs = sim.submit_rule("metrics_gif")
+
+    # Every fragment of metrics_gif must achieve per-task -hold_jid_ad (hold_ad is set, hold_jid is empty)
+    for sub_start, sub_end, hold_ad, hold_jid in gif_subs:
+        assert hold_jid == [], (
+            f"metrics_gif {sub_start}-{sub_end} fell back to whole-job -hold_jid={hold_jid!r}, "
+            f"expected empty hold_jid and per-task hold_ad={hold_ad!r}"
+        )
+        assert hold_ad is not None, f"metrics_gif {sub_start}-{sub_end} has no hold_ad"
+        assert_sge_would_accept(sim, sub_start, sub_end, hold_ad, hold_jid)
+        assert_no_dependency_dropped(sim, "metrics_gif", sub_start, sub_end, hold_ad, hold_jid)
+
+    # Every fragment of metrics_fs must also achieve per-task -hold_jid_ad
+    for sub_start, sub_end, hold_ad, hold_jid in fs_subs:
+        assert hold_jid == [], (
+            f"metrics_fs {sub_start}-{sub_end} fell back to whole-job -hold_jid={hold_jid!r}"
+        )
+        assert hold_ad is not None, f"metrics_fs {sub_start}-{sub_end} has no hold_ad"
+        assert_sge_would_accept(sim, sub_start, sub_end, hold_ad, hold_jid)
+        assert_no_dependency_dropped(sim, "metrics_fs", sub_start, sub_end, hold_ad, hold_jid)
