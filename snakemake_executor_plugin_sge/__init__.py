@@ -351,6 +351,19 @@ class Executor(RemoteExecutor):
     def __post_init__(self, test_mode: bool = False) -> None:
         self.test_mode = test_mode
         self.run_uuid = str(uuid.uuid4())
+        # Short per-run tag for every file this run writes into the shared
+        # log/meta directories (task maps, manifests, array scripts, log
+        # sub-directories). Those directories are per output dir, not per
+        # run, and array tasks read their task map when they START, so two
+        # runs writing the same file name let the second silently replace
+        # the task maps of the first run's still-queued arrays: they then
+        # decode another run's commands, or none. Happened 2026-09-27 on EPAD
+        # (a 94-session rerun overwrote chunk 1-2 of the main run's metrics
+        # and z-score maps). Taken from the random UUID before any
+        # jobname_prefix is prepended, so it is unique per run even when a
+        # prefix is set; without one it equals the SGE job-name suffix, so
+        # files and jobs are easy to match up.
+        self.run_tag = self.run_uuid[:8]
         if self.workflow.executor_settings.jobname_prefix:
             self.run_uuid = "_".join(
                 [self.workflow.executor_settings.jobname_prefix, self.run_uuid]
@@ -410,7 +423,8 @@ class Executor(RemoteExecutor):
         self._subject_to_idx: Dict[str, int] = {}
         self._next_subject_idx: int = 0
 
-        # Per-rule chunk counter used only for unique file naming.
+        # Per-rule chunk counter used only for unique file naming (within this
+        # run; run_tag keeps names unique across runs).
         # (Replaces the old _rule_wave_num / _rule_task_end pair, which also
         # drove task-ID sequencing — that role is now handled by the global
         # subject index above.)
@@ -450,6 +464,14 @@ class Executor(RemoteExecutor):
     # ------------------------------------------------------------------
     # Job dispatch
     # ------------------------------------------------------------------
+
+    def _chunk_stem(self, chunk_num: int) -> str:
+        """Name stem for everything one array chunk writes into the shared
+        log/meta directories: task map, manifest, array script, log
+        sub-directories. Carries this run's tag, so a later run in the same
+        output directory can never overwrite an earlier run's files while
+        that run's arrays are still queued (see run_tag in __post_init__)."""
+        return f"{self.run_tag}_chunk{chunk_num}"
 
     def run_jobs(self, jobs: List[JobExecutorInterface]) -> None:
         """Classify and dispatch incoming jobs.
@@ -871,7 +893,7 @@ class Executor(RemoteExecutor):
         single_meta_dir.mkdir(parents=True, exist_ok=True)
         safe_name = re.sub(r"[^\w-]", "_", job.name)
 
-        single_script_path = single_meta_dir / f"{safe_name}_{self.run_uuid[:8]}.sh"
+        single_script_path = single_meta_dir / f"{safe_name}_{self.run_tag}.sh"
         single_script_path.write_text("\n".join([
             "#!/bin/bash",
             "set -euo pipefail",
@@ -1027,7 +1049,7 @@ class Executor(RemoteExecutor):
         chunk_num = self._rule_chunk_num.get(rule_key, 0) + 1
         self._rule_chunk_num[rule_key] = chunk_num
 
-        task_map_file = meta_dir / f"task_map_chunk{chunk_num}.b64"
+        task_map_file = meta_dir / f"task_map_{self._chunk_stem(chunk_num)}.b64"
         task_map_file.write_text(task_map_b64)
 
         # Human-readable manifest for debugging: global index → wildcards.
@@ -1039,7 +1061,7 @@ class Executor(RemoteExecutor):
             }
             for idx, job in zip(subject_idxs, jobs)
         }
-        manifest_path = meta_dir / f"task_manifest_chunk{chunk_num}.json"
+        manifest_path = meta_dir / f"task_manifest_{self._chunk_stem(chunk_num)}.json"
         try:
             manifest_path.write_text(json.dumps(manifest, indent=2))
         except OSError as exc:
@@ -1079,7 +1101,7 @@ class Executor(RemoteExecutor):
         n_sub_chunks = max(1, -(-len(jobs) // array_limit))
         for _sc in range(1, n_sub_chunks + 1):
             for _sr in range(1, _SUB_RANGE_LOOKAHEAD + 1):
-                (first_job_logdir / f"chunk{chunk_num}_{_sc}_{_sr}").mkdir(
+                (first_job_logdir / f"{self._chunk_stem(chunk_num)}_{_sc}_{_sr}").mkdir(
                     parents=True, exist_ok=True
                 )
 
@@ -1148,7 +1170,7 @@ class Executor(RemoteExecutor):
                 ]
 
                 script_path = (
-                    meta_dir / f"array_job_chunk{chunk_num}_{sub_chunk}_{sub_range_num}.sh"
+                    meta_dir / f"array_job_{self._chunk_stem(chunk_num)}_{sub_chunk}_{sub_range_num}.sh"
                 )
                 script_path.write_text("\n".join(script_lines))
                 script_path.chmod(0o755)
@@ -1165,7 +1187,7 @@ class Executor(RemoteExecutor):
                 # ... Permission denied" on the log path (the directory and
                 # its ownership were both fine -- this is an NFS large-flat-
                 # directory scaling failure, not an actual permission issue).
-                sub_range_logdir = first_job_logdir / f"chunk{chunk_num}_{sub_chunk}_{sub_range_num}"
+                sub_range_logdir = first_job_logdir / f"{self._chunk_stem(chunk_num)}_{sub_chunk}_{sub_range_num}"
                 sub_range_logdir.mkdir(parents=True, exist_ok=True)
 
                 job_params = {
