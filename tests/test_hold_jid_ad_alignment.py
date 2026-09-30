@@ -60,7 +60,11 @@ class Simulator:
     job is created for them — mirroring Snakemake skipping satisfied targets).
     """
 
-    def __init__(self, subjects, rule_deps, needed):
+    def __init__(self, subjects, rule_deps, needed, dag_only=None):
+        """``dag_only[rule]`` = subjects whose job for ``rule`` is part of the
+        workflow graph (downstream jobs list it as a dependency) but is NOT
+        submitted because its output already exists -- Snakemake keeps such
+        jobs in ``dag.dependencies`` and marks them not-needrun."""
         self.subjects = subjects
         self.rule_deps = rule_deps          # rule -> list of upstream rules
         self.needed = needed                # rule -> set(subjects)
@@ -85,10 +89,20 @@ class Simulator:
                     up[self.jobs[(ur, s)]] = None
             deps[job] = up
 
+        # Jobs that are in the DAG but already satisfied (not submitted).
+        self.ghosts = set()
+        for rule, subs in (dag_only or {}).items():
+            for s in subs:
+                ghost = Job(rule, s)
+                self.ghosts.add(ghost)
+                for r2, ups in rule_deps.items():
+                    if rule in ups and (r2, s) in self.jobs:
+                        deps[self.jobs[(r2, s)]][ghost] = None
+
         # Forward edges (dag.depending): the exact inverse of deps, mirroring
         # what the real DAG.update() populates alongside dependencies before
         # any submission begins.
-        depending = {job: {} for job in self.jobs.values()}
+        depending = {job: {} for job in list(self.jobs.values()) + list(self.ghosts)}
         for job, ups in deps.items():
             for up_job in ups:
                 depending[up_job][job] = None
@@ -98,7 +112,13 @@ class Simulator:
         ex.logger = logging.getLogger("sim")
         ex.logger.addHandler(logging.NullHandler())
         ex.workflow = types.SimpleNamespace(
-            dag=types.SimpleNamespace(dependencies=deps, depending=depending)
+            dag=types.SimpleNamespace(
+                dependencies=deps,
+                depending=depending,
+                # Mirrors snakemake.dag.DAG.needrun(job): False for jobs that
+                # are in the graph but already satisfied.
+                needrun=lambda job: job not in self.ghosts,
+            )
         )
         ex._job_to_sge = {}
         ex._array_job_range = {}
@@ -602,3 +622,53 @@ def test_downstream_varying_upstream_dependencies_causes_per_task_hold():
         assert hold_ad is not None, f"metrics_fs {sub_start}-{sub_end} has no hold_ad"
         assert_sge_would_accept(sim, sub_start, sub_end, hold_ad, hold_jid)
         assert_no_dependency_dropped(sim, "metrics_fs", sub_start, sub_end, hold_ad, hold_jid)
+
+
+def test_dependency_already_satisfied_for_one_subject_must_not_block_whole_array():
+    """Reproduces the EPAD metrics_gif jobs held behind ONE long TRACULA session
+    (2026-09-30): 53 sessions (864-916) whose metrics waited on the whole
+    tractqc_gif array because it never split where metrics_gif fragmented.
+
+    Shape: metrics_gif depends on tractqc_gif and on z_score. For one session
+    (870) z_score is part of the workflow graph but already finished, so it is
+    not submitted. That makes metrics_gif fragment around 870 (its submitted
+    upstream arrays differ there), but tractqc_gif -- submitted earlier, and
+    splitting only on the *graph's* dependency rules, which include the finished
+    z_score job -- stays one 864-916 array. No metrics fragment can then match
+    tractqc_gif's range, so every fragment falls back to a whole-array hold:
+    all 53 sessions wait for the slowest TRACULA/tract-QC task.
+
+    Invariant asserted: every metrics_gif fragment holds per-task
+    (-hold_jid_ad) on BOTH upstream rules and uses no whole-job hold.
+    """
+    subjects = [f"sub{i}" for i in range(864, 917)]
+    rule_deps = {
+        "tracula_gif": [],
+        "tractqc_gif": ["tracula_gif"],
+        "z_score": [],
+        "metrics_gif": ["tractqc_gif", "z_score"],
+    }
+    needed = {
+        "tracula_gif": set(subjects),
+        "tractqc_gif": set(subjects),
+        "z_score": set(subjects) - {"sub870"},
+        "metrics_gif": set(subjects),
+    }
+    sim = Simulator(subjects, rule_deps, needed, dag_only={"z_score": {"sub870"}})
+
+    for rule in ("tracula_gif", "tractqc_gif", "z_score"):
+        sim.submit_rule(rule)
+    metrics_subs = sim.submit_rule("metrics_gif")
+
+    # metrics_gif fragments around the session with no z_score job to wait for.
+    assert [(s, e) for s, e, _, _ in metrics_subs] == [(1, 6), (7, 7), (8, 53)], metrics_subs
+
+    for sub_start, sub_end, hold_ad, hold_jid in metrics_subs:
+        assert hold_jid == [], (
+            f"metrics_gif {sub_start}-{sub_end} falls back to whole-job holds "
+            f"{hold_jid}: every session in it would wait for the slowest task "
+            f"of those upstream arrays"
+        )
+        assert hold_ad, (sub_start, sub_end)
+        assert_sge_would_accept(sim, sub_start, sub_end, hold_ad, hold_jid)
+        assert_no_dependency_dropped(sim, "metrics_gif", sub_start, sub_end, hold_ad, hold_jid)

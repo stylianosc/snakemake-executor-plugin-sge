@@ -791,12 +791,24 @@ class Executor(RemoteExecutor):
                 # will inevitably fragment due to varying upstream prerequisites, causing
                 # all fragments of the downstream array to fall back to whole-job -hold_jid
                 # and sit in hqw (observed on ADNI-3 metrics_gif, 2026-09-15).
+                #
+                # Only dependencies that will actually be submitted count. The
+                # DAG also lists jobs whose output already exists (not
+                # "needrun"); they never get an SGE job, so the downstream
+                # array's own fragmenting (_split_by_upstream_boundaries, which
+                # sees submitted upstreams only) ignores them. Counting them here
+                # made this key identical for subjects where the downstream
+                # fragments differ, so the upstream stayed one wide array and
+                # every downstream fragment fell back to a whole-array hold
+                # (EPAD metrics_gif, 2026-09-30: 53 sessions waited on the one
+                # slowest TRACULA session).
                 key = frozenset(
                     (
                         getattr(getattr(down_job, "rule", None), "name", None),
                         frozenset(
                             getattr(getattr(dep_job, "rule", None), "name", None)
                             for dep_job in self.workflow.dag.dependencies.get(down_job, {})
+                            if self._will_be_submitted(dep_job)
                         ),
                     )
                     for down_job in self.workflow.dag.depending.get(job, {})
@@ -811,6 +823,18 @@ class Executor(RemoteExecutor):
             if current_run:
                 result.append((current_run[0], current_run[-1], current_run))
         return result
+
+    def _will_be_submitted(self, job) -> bool:
+        """False for a job that is in the DAG but already satisfied (its output
+        exists), which Snakemake marks as not needing to run and so never
+        reaches SGE. True if that cannot be determined."""
+        needrun = getattr(self.workflow.dag, "needrun", None)
+        if not callable(needrun):
+            return True
+        try:
+            return bool(needrun(job))
+        except Exception:
+            return True
 
     def _upstream_ext_ids(self, job):
         """Yield ``(upstream_job, sge_jobid, task_idx)`` for each upstream.
