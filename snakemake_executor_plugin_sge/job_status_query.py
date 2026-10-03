@@ -90,13 +90,31 @@ _ERROR_STATES   = {"Eqw", "Ec", "E", "d", "dr", "dt", "dRr", "dT"}
 _RETRYABLE_ERROR_STATES = {"Eqw", "Ec", "E"}
 _DELETING_STATES = {"d", "dr", "dt", "dRr", "dT"}
 
-# Jobs already given their one automatic clear, so a genuinely broken job fails
-# on the second observation instead of being cleared forever.
-_AUTO_CLEARED: set = set()
+# How many times each job may be cleared automatically. An array job holds many
+# tasks that reach their execution hosts at different times, so each can hit the
+# NFS race independently; one clear per job left every later task in Eqw until
+# someone ran qmod by hand. The cap still lets a genuinely broken job fail.
+_MAX_AUTO_CLEARS = 5
+_AUTO_CLEARS: Dict[str, int] = {}
+
+# Message SGE writes when the execution host cannot yet see the log directory.
+_CHDIR_ERROR = "can't chdir to"
+
+
+def _error_is_transient_chdir(base_id: str) -> bool:
+    """True when the job's recorded error reason is only a missing log directory."""
+    try:
+        out = subprocess.check_output(
+            f"qstat -j {base_id}", shell=True, text=True, stderr=subprocess.STDOUT
+        )
+    except subprocess.CalledProcessError:
+        return False
+    reasons = [ln for ln in out.splitlines() if ln.startswith("error reason")]
+    return bool(reasons) and all(_CHDIR_ERROR in ln for ln in reasons)
 
 
 def _try_clear_error_state(base_id: str, logger) -> bool:
-    """Clear a job's error state once, so SGE re-queues it.
+    """Clear a job's error state so SGE re-queues it, at most _MAX_AUTO_CLEARS times.
 
     Exists for a specific, recurring failure: a task can land on an execution
     host before that host's NFS client sees the log directory created moments
@@ -108,18 +126,23 @@ def _try_clear_error_state(base_id: str, logger) -> bool:
     error handler raises KeyError while removing the job from its running set,
     which aborts the whole workflow and cancels every job already submitted. A
     single transient scheduling hiccup therefore destroys an entire submission.
+
+    Only errors that are purely "can't chdir" are cleared; any other error
+    reason is a real failure and is reported as such immediately.
     """
-    if base_id in _AUTO_CLEARED:
+    if _AUTO_CLEARS.get(base_id, 0) >= _MAX_AUTO_CLEARS:
         return False
-    _AUTO_CLEARED.add(base_id)
+    if not _error_is_transient_chdir(base_id):
+        return False
+    _AUTO_CLEARS[base_id] = _AUTO_CLEARS.get(base_id, 0) + 1
     try:
         subprocess.check_output(
             f"qmod -cj {base_id}", shell=True, text=True, stderr=subprocess.STDOUT
         )
         logger.warning(
-            f"SGE job {base_id} was in an error state; cleared it once "
-            f"automatically (usually a transient NFS visibility failure on the "
-            f"log directory). It will be reported as failed if it errors again."
+            f"SGE job {base_id} was in an error state; cleared it automatically "
+            f"({_AUTO_CLEARS[base_id]}/{_MAX_AUTO_CLEARS}; usually a transient NFS "
+            f"visibility failure on the log directory)."
         )
         return True
     except subprocess.CalledProcessError as exc:
